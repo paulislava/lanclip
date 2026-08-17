@@ -49,12 +49,13 @@ public enum RelPath {
         }
 
         guard !cleaned.isEmpty else { return nil }
-        guard cleaned.count <= maxComponent else { return nil }
 
         let base = cleaned.split(separator: ".", maxSplits: 1).first.map(String.init) ?? cleaned
         if reserved.contains(base.lowercased()) {
             cleaned += "_"
         }
+
+        guard cleaned.count <= maxComponent else { return nil }
         return cleaned
     }
 }

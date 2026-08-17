@@ -36,6 +36,16 @@ final class RelPathTests: XCTestCase {
         XCTAssertEqual(RelPath.normalize("com1.txt"), "com1.txt_")
     }
 
+    func testRejectsReservedNameExceedingLimitAfterSuffix() {
+        let overLimit = "nul." + String(repeating: "a", count: 146)
+        XCTAssertNil(RelPath.normalize(overLimit))
+    }
+
+    func testAcceptsReservedNameWithinLimitAfterSuffix() {
+        let withinLimit = "nul." + String(repeating: "a", count: 145)
+        XCTAssertEqual(RelPath.normalize(withinLimit), withinLimit + "_")
+    }
+
     func testRejectsOverlongComponentAndPath() {
         XCTAssertNil(RelPath.normalize(String(repeating: "a", count: 151)))
         let deep = (0..<10).map { _ in String(repeating: "b", count: 45) }.joined(separator: "/")
