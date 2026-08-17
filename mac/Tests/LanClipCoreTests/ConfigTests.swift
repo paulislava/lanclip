@@ -85,4 +85,18 @@ final class ConfigTests: XCTestCase {
     func testValidateAcceptsGoodConfig() throws {
         try Config(token: "t", peers: ["pc"]).validate()
     }
+
+    func testPreservesRestrictivePermissionsOnUpdate() throws {
+        let url = directory.appendingPathComponent("config.json")
+        // Создаём файл с дефолтными правами (обычно 0644)
+        try Data("{}".utf8).write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: url.path)
+
+        // Перезаписываем конфиг
+        try Config(token: "secret", peers: ["pc"]).write(to: url)
+
+        // Проверяем, что права остались 0600
+        let permissions = try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber
+        XCTAssertEqual(permissions?.int16Value, 0o600)
+    }
 }

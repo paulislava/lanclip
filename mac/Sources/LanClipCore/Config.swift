@@ -67,8 +67,11 @@ public struct Config: Codable, Equatable, Sendable {
                                                withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .withoutEscapingSlashes]
-        try encoder.encode(self).write(to: url)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        guard FileManager.default.createFile(atPath: url.path,
+                                             contents: try encoder.encode(self),
+                                             attributes: [.posixPermissions: 0o600]) else {
+            throw ConfigError.malformed("не удалось записать конфиг по пути \(url.path)")
+        }
     }
 
     public func validate() throws {
