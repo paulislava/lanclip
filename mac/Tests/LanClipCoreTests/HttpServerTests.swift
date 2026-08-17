@@ -269,6 +269,32 @@ final class HttpServerTests: XCTestCase {
         }
     }
 
+    func testRestartCycleReacquiresAPort() throws {
+        // Доказывает, что последовательный start() → stop() → start() → stop() остаётся
+        // рабочим после того, как обращения к `listener` были заведены под общий
+        // `stateLock` (починка гонки ARC-счётчика при конкурентной записи сильной
+        // ссылки). За самой гонкой не гоняемся — это ненадёжно и даёт флаки;
+        // достаточно, что цикл перезапуска работает и порт занимается заново.
+        let store = makeStore()
+        let server = HttpServer(config: makeConfig(), snapshots: store, hostName: "mac", pull: succeedingPull)
+
+        try server.start()
+        let firstPort = server.boundPort
+        XCTAssertNotEqual(firstPort, 0)
+        server.stop()
+
+        try server.start()
+        let secondPort = server.boundPort
+        XCTAssertNotEqual(secondPort, 0)
+        defer { server.stop() }
+
+        let connection = openConnection(port: secondPort)
+        defer { connection.cancel() }
+        let raw = Data("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Clip-Token: \(testToken)\r\n\r\n".utf8)
+        let response = try sendAndReadResponse(connection, raw: raw)
+        XCTAssertEqual(response.status, 200)
+    }
+
     func testEndToEndClipRoundTripWithAndWithoutToken() throws {
         clipboard.content = .text("сквозной обмен")
         let store = makeStore()

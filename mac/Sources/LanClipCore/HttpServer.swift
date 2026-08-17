@@ -102,14 +102,16 @@ public final class HttpServer: @unchecked Sendable {
 
         stateLock.lock()
         _boundPort = Int(listener.port?.rawValue ?? 0)
-        stateLock.unlock()
-
         self.listener = listener
+        stateLock.unlock()
     }
 
     public func stop() {
-        listener?.cancel()
+        stateLock.lock()
+        let current = listener
         listener = nil
+        stateLock.unlock()
+        current?.cancel()
     }
 
     private func accept(_ connection: NWConnection) {
