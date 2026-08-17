@@ -101,7 +101,13 @@ public func parseHttpRequest(_ data: Data) throws -> HttpRequest {
     }
 
     let body = data[separator.upperBound...]
-    let declared = Int(headers["content-length"] ?? "0") ?? 0
+    let declared: Int
+    if let clHeader = headers["content-length"] {
+        guard let value = Int(clHeader), value >= 0 else { throw HttpParseError.malformed }
+        declared = value
+    } else {
+        declared = 0
+    }
     guard body.count >= declared else { throw HttpParseError.incomplete }
 
     return HttpRequest(method: String(parts[0]).uppercased(), path: path, query: query,
@@ -126,9 +132,14 @@ public func parseHttpResponse(_ data: Data) throws -> (status: Int, headers: [St
         headers[kv[0].lowercased()] = kv[1].trimmingCharacters(in: .whitespaces)
     }
 
-    let body = Data(data[separator.upperBound...])
-    if let declared = Int(headers["content-length"] ?? ""), body.count < declared {
-        throw HttpParseError.incomplete
+    let bodySlice = data[separator.upperBound...]
+    let declared: Int
+    if let clHeader = headers["content-length"] {
+        guard let value = Int(clHeader), value >= 0 else { throw HttpParseError.malformed }
+        declared = value
+    } else {
+        declared = 0
     }
-    return (status, headers, body)
+    guard bodySlice.count >= declared else { throw HttpParseError.incomplete }
+    return (status, headers, Data(bodySlice.prefix(declared)))
 }

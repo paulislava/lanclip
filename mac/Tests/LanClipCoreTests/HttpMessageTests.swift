@@ -57,4 +57,29 @@ final class HttpMessageTests: XCTestCase {
         XCTAssertEqual(parsed.headers["content-length"], "3")
         XCTAssertEqual(parsed.body, Data("abc".utf8))
     }
+
+    func testRejectsNegativeContentLength() {
+        XCTAssertThrowsError(try parseHttpRequest(Data("POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n".utf8))) { error in
+            XCTAssertEqual(error as? HttpParseError, .malformed)
+        }
+    }
+
+    func testRejectsNonnumericContentLength() {
+        XCTAssertThrowsError(try parseHttpRequest(Data("POST / HTTP/1.1\r\nContent-Length: abc\r\n\r\n".utf8))) { error in
+            XCTAssertEqual(error as? HttpParseError, .malformed)
+        }
+    }
+
+    func testRequestWithoutContentLengthHasEmptyBody() throws {
+        let raw = Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        let request = try parseHttpRequest(raw)
+        XCTAssertTrue(request.body.isEmpty)
+    }
+
+    func testResponseBodyTruncatedToContentLength() throws {
+        let raw = Data("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcXYZ".utf8)
+        let parsed = try parseHttpResponse(raw)
+        XCTAssertEqual(parsed.body, Data("abc".utf8))
+        XCTAssertEqual(parsed.body.count, 3)
+    }
 }

@@ -6,7 +6,20 @@ public func isPrivateAddress(_ address: String) -> Bool {
 
     if bare.contains(":") {
         let lowered = bare.lowercased()
-        return lowered == "::1" || lowered.hasPrefix("fe80:") || lowered.hasPrefix("fd")
+        if lowered == "::1" { return true }
+
+        // Extract first hex group: fe80::1 -> "fe80", ::1 -> ""
+        let firstGroup = lowered.split(separator: ":").first.map(String.init) ?? ""
+        if firstGroup.isEmpty { return true }  // :: prefix covers loopback and link-local
+
+        // Parse first hex group to check ranges
+        if let first = Int(firstGroup, radix: 16) {
+            // Link-local: fe80::/10 (fe80 to febf)
+            if first >= 0xfe80 && first <= 0xfebf { return true }
+            // ULA: fc00::/7 (fc00 to fdff)
+            if first >= 0xfc00 && first <= 0xfdff { return true }
+        }
+        return false
     }
 
     let octets = bare.split(separator: ".").compactMap { Int($0) }

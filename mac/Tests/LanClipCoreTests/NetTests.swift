@@ -14,4 +14,10 @@ final class NetTests: XCTestCase {
             XCTAssertFalse(isPrivateAddress(address), address)
         }
     }
+
+    func testAcceptsIPv6Ranges() {
+        for address in ["fe81::1", "febf::1", "fc00::1"] {
+            XCTAssertTrue(isPrivateAddress(address), address)
+        }
+    }
 }
