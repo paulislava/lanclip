@@ -85,7 +85,8 @@ public final class SnapshotStore {
         guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return [] }
 
         if !isDirectory.boolValue {
-            return [Entry(url: url, rel: url.lastPathComponent, size: try size(of: url))]
+            let resolved = url.resolvingSymlinksInPath()
+            return [Entry(url: resolved, rel: url.lastPathComponent, size: try size(of: resolved))]
         }
 
         let base = url.lastPathComponent
@@ -99,7 +100,8 @@ public final class SnapshotStore {
             var isChildDirectory: ObjCBool = false
             guard fileManager.fileExists(atPath: child.path, isDirectory: &isChildDirectory) else { continue }
             if isChildDirectory.boolValue { continue }
-            entries.append(Entry(url: child, rel: base + "/" + subpath, size: try size(of: child)))
+            let resolved = child.resolvingSymlinksInPath()
+            entries.append(Entry(url: resolved, rel: base + "/" + subpath, size: try size(of: resolved)))
         }
         return entries
     }

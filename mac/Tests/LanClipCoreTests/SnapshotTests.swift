@@ -66,6 +66,24 @@ final class SnapshotTests: XCTestCase {
         XCTAssertEqual(snapshot.manifest.totalSize, 3)
     }
 
+    func testSymlinkToFileOutsideFolderReportsResolvedSize() throws {
+        let target = try makeFile("вне/большой.bin", String(repeating: "x", count: 42))
+        _ = try makeFile("папка/обычный.txt", "a")
+        let link = directory.appendingPathComponent("папка/ссылка.bin")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        clipboard.content = .files([directory.appendingPathComponent("папка")])
+        let store = SnapshotStore(reader: clipboard)
+        let snapshot = try store.current()
+
+        guard let blob = snapshot.manifest.blobs?.first(where: { $0.rel == "папка/ссылка.bin" }) else {
+            return XCTFail("missing symlink blob")
+        }
+        let bytes = try store.blob(index: blob.i, seq: snapshot.manifest.seq)
+        XCTAssertEqual(blob.size, bytes?.count)
+        XCTAssertEqual(bytes?.count, 42)
+    }
+
     func testStaleSeqIsRejected() throws {
         clipboard.content = .text("первый")
         let store = SnapshotStore(reader: clipboard)
