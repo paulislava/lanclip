@@ -47,8 +47,47 @@ mkdir -p "$HOME/.local/bin"
 cp -f "$BUILT_BIN" "$BIN_DEST"
 chmod +x "$BIN_DEST"
 
-echo "==> Ad-hoc подпись (чтобы пересборка не сбрасывала разрешение Accessibility)"
-codesign -s - --force "$BIN_DEST"
+# Подпись устойчивой личностью, а НЕ ad-hoc.
+#
+# Ad-hoc (`codesign -s -`) здесь не годится, хотя раньше стояла именно она:
+# у ad-hoc подписи нет устойчивого идентификатора — он выводится из хеша
+# содержимого (`lanclipd-555549446a8d…`), поэтому каждая пересборка выглядит
+# для macOS новой программой, и выданные ей разрешения TCC (Local Network,
+# Accessibility) к новому бинарнику не относятся. Это ломало агент при
+# каждой переустановке: `pull` начинал отвечать `noPeer`, потому что
+# исходящие соединения в локальную сеть блокировались, а синтез вставки
+# молча перестал работать.
+#
+# Подпись сертификатом разработчика плюс фиксированный идентификатор дают
+# устойчивое designated requirement, которое пересборка не меняет, поэтому
+# разрешения выдаются один раз.
+SIGN_IDENTITY="${LANCLIP_SIGN_IDENTITY:-Apple Development: Pavel Kondratov (9CBTJK8ALK)}"
+SIGN_ID="space.paulislava.lanclip"
+
+echo "==> Подпись: $SIGN_IDENTITY (идентификатор $SIGN_ID)"
+if ! codesign -s "$SIGN_IDENTITY" -i "$SIGN_ID" --force "$BIN_DEST" 2>/dev/null; then
+    echo "ОШИБКА: не удалось подписать сертификатом «$SIGN_IDENTITY»." >&2
+    echo "Доступные личности для подписи кода:" >&2
+    security find-identity -v -p codesigning >&2
+    echo "Задай нужную через LANCLIP_SIGN_IDENTITY=… и повтори." >&2
+    echo "Ad-hoc подпись здесь не подходит: она сбрасывает разрешения при каждой пересборке." >&2
+    exit 1
+fi
+
+# Проверяем, что личность действительно устойчивая: идентификатор наш,
+# а подпись — не ad-hoc. Иначе разрешения снова будут слетать, и узнаем мы
+# об этом только когда агент перестанет видеть соседа.
+SIGN_INFO="$(codesign -dv "$BIN_DEST" 2>&1)"
+if echo "$SIGN_INFO" | grep -q "Signature=adhoc"; then
+    echo "ОШИБКА: подпись оказалась ad-hoc — разрешения будут слетать при пересборке." >&2
+    exit 1
+fi
+if ! echo "$SIGN_INFO" | grep -q "Identifier=$SIGN_ID"; then
+    echo "ОШИБКА: идентификатор подписи не $SIGN_ID:" >&2
+    echo "$SIGN_INFO" | grep Identifier >&2
+    exit 1
+fi
+echo "    подпись устойчивая, идентификатор $SIGN_ID"
 
 echo "==> Конфиг: $CONFIG_FILE"
 mkdir -p "$CONFIG_DIR"
