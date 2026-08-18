@@ -72,6 +72,15 @@ namespace LanClip
     class SnapshotStore
     {
         readonly IClipboardReader reader;
+        // Находка I7 финального ревью: HttpServer раньше сериализовал ЛЮБОЙ
+        // Route() (и значит, любой вызов Current()/Blob()) через собственный
+        // STA-исполнитель — эта блокировка была случайным побочным эффектом того
+        // исполнителя, а не осознанной защитой самого SnapshotStore. После того
+        // как этот избыточный STA-хоп убран (см. HttpServer.cs) и запросы
+        // ThreadPool поехали параллельно, доступ к cached обязан быть
+        // потокобезопасным сам по себе, а не полагаться на внешнюю сериализацию,
+        // которой больше нет.
+        readonly object gate = new object();
         ClipSnapshot cached;
 
         public SnapshotStore(IClipboardReader reader)
@@ -81,42 +90,48 @@ namespace LanClip
 
         public ClipSnapshot Current()
         {
-            int seq = reader.ChangeCount();
-            if (cached != null && cached.Manifest.Seq == seq)
+            lock (gate)
             {
-                return cached;
-            }
+                int seq = reader.ChangeCount();
+                if (cached != null && cached.Manifest.Seq == seq)
+                {
+                    return cached;
+                }
 
-            ClipSnapshot snapshot = Build(seq, reader.Read());
-            cached = snapshot;
-            return snapshot;
+                ClipSnapshot snapshot = Build(seq, reader.Read());
+                cached = snapshot;
+                return snapshot;
+            }
         }
 
         // null — индекс вне диапазона (нет такого blob-а в текущем снимке).
         public BlobPayload Blob(int index, int seq)
         {
-            ClipSnapshot snapshot = Current();
-            if (snapshot.Manifest.Seq != seq)
+            lock (gate)
             {
-                throw new StaleSeqException();
-            }
+                ClipSnapshot snapshot = Current();
+                if (snapshot.Manifest.Seq != seq)
+                {
+                    throw new StaleSeqException();
+                }
 
-            if (snapshot.ImagePng != null)
-            {
-                return index == 0 ? BlobPayload.OfData(snapshot.ImagePng) : null;
-            }
+                if (snapshot.ImagePng != null)
+                {
+                    return index == 0 ? BlobPayload.OfData(snapshot.ImagePng) : null;
+                }
 
-            string source;
-            if (!snapshot.Sources.TryGetValue(index, out source))
-            {
-                return null;
+                string source;
+                if (!snapshot.Sources.TryGetValue(index, out source))
+                {
+                    return null;
+                }
+                // Размер считается заново с диска (не из манифеста) — это тот же файл,
+                // который HttpServer сейчас откроет и прочитает потоком, поэтому
+                // Content-Length, ушедший в заголовках, гарантированно совпадает с тем,
+                // что реально будет прочитано дальше.
+                long size = new FileInfo(source).Length;
+                return BlobPayload.OfFile(source, size);
             }
-            // Размер считается заново с диска (не из манифеста) — это тот же файл,
-            // который HttpServer сейчас откроет и прочитает потоком, поэтому
-            // Content-Length, ушедший в заголовках, гарантированно совпадает с тем,
-            // что реально будет прочитано дальше.
-            long size = new FileInfo(source).Length;
-            return BlobPayload.OfFile(source, size);
         }
 
         static ClipSnapshot Build(int seq, ClipContent content)

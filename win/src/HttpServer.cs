@@ -137,12 +137,6 @@ namespace LanClip
         readonly Func<PullResult> pull;
         readonly string bindHost;
 
-        // Создаётся заново в каждом Start() и завершается в Stop() — иначе либо
-        // фоновый STA-поток пережил бы Stop() (утечка на весь остаток процесса), либо
-        // повторный Start() после Stop() унаследовал бы уже остановленный исполнитель
-        // и любое обращение к буферу падало бы ObjectDisposedException.
-        StaExecutor executor;
-
         HttpListener listener;
         Thread acceptThread;
         int boundPort;
@@ -193,7 +187,6 @@ namespace LanClip
 
             listener = newListener;
             boundPort = config.Port;
-            executor = new StaExecutor();
             running = true;
 
             acceptThread = new Thread(new ThreadStart(AcceptLoop));
@@ -231,16 +224,6 @@ namespace LanClip
             if (thread != null && thread != Thread.CurrentThread)
             {
                 thread.Join();
-            }
-
-            // Только после того, как поток приёма остановлен и присоединён — то есть
-            // новых Handle()-вызовов больше не запускается, — можно безопасно
-            // завершить исполнителя STA-потока для этого цикла Start/Stop.
-            StaExecutor currentExecutor = executor;
-            executor = null;
-            if (currentExecutor != null)
-            {
-                currentExecutor.Shutdown();
             }
         }
 
@@ -324,13 +307,19 @@ namespace LanClip
             HttpRequestSpec spec = new HttpRequestSpec(httpRequest.HttpMethod, httpRequest.Url.AbsolutePath,
                 query, headers);
 
-            // Все обращения к буферу (снимок манифеста, чтение блоба, pull) обязаны идти
-            // через единственный STA-поток исполнителя — на нём же в задаче 22 будет жить
-            // System.Windows.Forms.Clipboard, который вне STA работать не станет.
-            HttpResponseSpec response = executor.Invoke(new Func<HttpResponseSpec>(delegate
-            {
-                return Route(spec, config, snapshots, hostName, remote, pull);
-            }));
+            // Находка I7 финального ревью: раньше здесь стоял ЕЩЁ ОДИН, свой собственный
+            // STA-исполнитель HttpServer — избыточный, потому что WinClipboard (см.
+            // WinClipboard.cs) уже маршалит каждое обращение к System.Windows.Forms.
+            // Clipboard на СВОЙ отдельный STA-поток сам. Запрос без нужды прыгал через
+            // ДВА STA-потока подряд, и вдобавок весь Route() (включая долгий Pull())
+            // сериализовался через этот же исполнитель — пока один запрос ждал pull(),
+            // остальные (включая /health) не обслуживались вовсе. Route() теперь
+            // выполняется прямо на потоке из ThreadPool — запросы едут параллельно, а
+            // сериализация настоящего доступа к буферу остаётся на StaExecutor'е
+            // WinClipboard, где она и нужна. SnapshotStore.Current()/Blob() при этом
+            // обязаны сами быть потокобезопасны (добавлена блокировка — см. Snapshot.cs),
+            // раз теперь их можно вызвать из нескольких потоков одновременно.
+            HttpResponseSpec response = Route(spec, config, snapshots, hostName, remote, pull);
 
             WriteResponse(context, response);
         }

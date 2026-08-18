@@ -4,6 +4,7 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 
 namespace LanClip.Tests
 {
@@ -387,6 +388,77 @@ namespace LanClip.Tests
                         HttpWebResponse response = (HttpWebResponse)e.Response;
                         T.Eq(401, (int)response.StatusCode, "status without token");
                     }
+                }
+                finally
+                {
+                    server.Stop();
+                }
+            });
+
+            // Находка I7 финального ревью: раньше ЛЮБОЙ Route() (значит, и любой /pull)
+            // сериализовался через собственный STA-исполнитель HttpServer — пока шёл
+            // /pull, сервер не отвечал даже на /health для других соединений. Этот
+            // исполнитель убран (WinClipboard уже маршалит на СВОЙ отдельный STA сам),
+            // запросы теперь едут параллельно на ThreadPool.
+            T.Run("slow pull does not block a concurrent health request", delegate
+            {
+                FakeClipboard clipboard = new FakeClipboard();
+                SnapshotStore store = MakeStore(clipboard);
+                Config config = MakeConfig();
+                config.Port = FindFreePort();
+                Func<PullResult> slowPull = new Func<PullResult>(delegate
+                {
+                    Thread.Sleep(1000);
+                    PullResult result = new PullResult();
+                    result.Kind = "text";
+                    result.FileCount = 0;
+                    result.Bytes = 1;
+                    return result;
+                });
+                HttpServer server = new HttpServer(config, store, "win", slowPull, "127.0.0.1");
+                server.Start();
+                try
+                {
+                    Thread pullThread = new Thread(new ThreadStart(delegate
+                    {
+                        try
+                        {
+                            HttpWebRequest pullRequest = (HttpWebRequest)WebRequest.Create(
+                                "http://127.0.0.1:" + server.BoundPort + "/pull");
+                            pullRequest.Method = "POST";
+                            pullRequest.Headers["X-Clip-Token"] = TestToken;
+                            pullRequest.ContentLength = 0;
+                            using (HttpWebResponse response = (HttpWebResponse)pullRequest.GetResponse())
+                            {
+                                response.Close();
+                            }
+                        }
+                        catch (Exception)
+                        {
+                            // Побочный поток — сам исход /pull здесь не проверяется,
+                            // только то, что он не блокирует параллельный /health.
+                        }
+                    }));
+                    pullThread.IsBackground = true;
+                    pullThread.Start();
+
+                    // Даём /pull шанс реально начаться на сервере до того, как мерим /health.
+                    Thread.Sleep(200);
+
+                    DateTime started = DateTime.UtcNow;
+                    HttpWebRequest healthRequest = (HttpWebRequest)WebRequest.Create(
+                        "http://127.0.0.1:" + server.BoundPort + "/health");
+                    healthRequest.Method = "GET";
+                    healthRequest.Headers["X-Clip-Token"] = TestToken;
+                    using (HttpWebResponse response = (HttpWebResponse)healthRequest.GetResponse())
+                    {
+                        T.Eq(200, (int)response.StatusCode, "health status");
+                    }
+                    double elapsedMs = (DateTime.UtcNow - started).TotalMilliseconds;
+                    T.True(elapsedMs < 500, "/health не должен ждать окончания параллельного /pull (~1000мс), заняло "
+                        + elapsedMs + "мс");
+
+                    pullThread.Join(3000);
                 }
                 finally
                 {

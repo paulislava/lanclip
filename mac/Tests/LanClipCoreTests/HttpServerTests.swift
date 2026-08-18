@@ -389,6 +389,42 @@ final class HttpServerTests: XCTestCase {
         XCTAssertEqual(response.status, 200)
     }
 
+    /// I7 (находка финального ревью): `pull()` — единственный обработчик, способный
+    /// занять секунды (сеть + диск). Раньше он выполнялся прямо на серийной `queue`
+    /// сервера, которую делят ВСЕ соединения, — пока шёл `/pull`, сервер не отвечал
+    /// даже на `/health` для остальных подключений. Долгий `pull` (`sleep 1с`) не
+    /// должен мешать параллельному `/health` вернуться почти мгновенно.
+    func testSlowPullDoesNotBlockConcurrentHealthRequest() throws {
+        let store = makeStore()
+        let slowPull: () throws -> PullResult = {
+            Thread.sleep(forTimeInterval: 1.0)
+            return PullResult(kind: .text, fileCount: 0, bytes: 1)
+        }
+        let server = HttpServer(config: makeConfig(), snapshots: store, hostName: "mac", pull: slowPull)
+        try server.start()
+        defer { server.stop() }
+
+        let pullConnection = openConnection(port: server.boundPort)
+        defer { pullConnection.cancel() }
+        let pullRawText = "POST /pull HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Clip-Token: \(testToken)\r\n" +
+                          "Content-Length: 0\r\n\r\n"
+        let pullRaw = Data(pullRawText.utf8)
+        pullConnection.send(content: pullRaw, completion: .contentProcessed { _ in })
+
+        // Даём /pull шанс реально начаться на сервере до того, как мерим /health.
+        Thread.sleep(forTimeInterval: 0.2)
+
+        let started = Date()
+        let healthConnection = openConnection(port: server.boundPort)
+        defer { healthConnection.cancel() }
+        let healthRaw = Data("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Clip-Token: \(testToken)\r\n\r\n".utf8)
+        let healthResponse = try sendAndReadResponse(healthConnection, raw: healthRaw)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(healthResponse.status, 200)
+        XCTAssertLessThan(elapsed, 0.5, "/health не должен ждать окончания параллельного /pull (~1с)")
+    }
+
     func testLargeBlobIsDeliveredInFullOverChunkedSend() throws {
         let file = directory.appendingPathComponent("large.bin")
         let payload = Data((0..<700_000).map { UInt8($0 % 256) })

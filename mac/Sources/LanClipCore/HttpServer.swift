@@ -162,6 +162,22 @@ public final class HttpServer: @unchecked Sendable {
             do {
                 let request = try parseHttpRequest(buffer)
                 deadline.cancel()
+
+                // Находка I7 финального ревью: `pull` — единственный обработчик, который
+                // может занять секунды (сетевой обмен с соседом плюс запись на диск внутри
+                // `pullClient.pull()`). Раньше `route()` вызывался прямо здесь, на серийной
+                // `queue`, которую делят ВСЕ соединения сервера — пока `pull()` крутился,
+                // ни одно другое соединение (включая `/health` соседа) не получало ответа:
+                // сосед решал, что машина мертва, и сбрасывал кеш резолвера, а одновременное
+                // нажатие хоткея на двух машинах давало симметричный клинч. Остальные пути
+                // (`/health`, `/clip`, `/clip/blob`) остаются на `queue` без изменений — они
+                // читают уже готовый снимок и не блокируются на сети, а `SnapshotStore`
+                // спроектирован так, что его трогает только эта серийная очередь.
+                if request.method == "POST" && request.path == "/pull" {
+                    self.handlePull(request, remote: remote, on: connection)
+                    return
+                }
+
                 let response = HttpServer.route(request, config: self.config, snapshots: self.snapshots,
                                                  hostName: self.hostName, remote: remote, pull: self.pull)
                 self.respond(response, on: connection)
@@ -175,6 +191,25 @@ public final class HttpServer: @unchecked Sendable {
             } catch {
                 deadline.cancel()
                 self.respond(.empty(400), on: connection)
+            }
+        }
+    }
+
+    /// Прогоняет `route()` (и, значит, сам `pull()`) на глобальной параллельной
+    /// очереди — вне `queue`, которую делят все соединения сервера. Сериализация
+    /// самих вызовов `pullClient.pull()` (нужна и уже проверена — см. `main.swift`)
+    /// от этого не страдает: она устроена ВНУТРИ замыкания `pull`, переданного в
+    /// `HttpServer` (тот делает `pullQueue.sync { ... }` сам), а не здесь — этот
+    /// метод просто следит, чтобы вызывающий поток для этого замыкания не совпадал
+    /// с `queue`. Ответ отправляется обратно через `self.queue`, куда и должны
+    /// приходить все обращения к `connection`, как и в остальном коде класса.
+    private func handlePull(_ request: HttpRequest, remote: String, on connection: NWConnection) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let response = HttpServer.route(request, config: self.config, snapshots: self.snapshots,
+                                             hostName: self.hostName, remote: remote, pull: self.pull)
+            self.queue.async {
+                self.respond(response, on: connection)
             }
         }
     }
