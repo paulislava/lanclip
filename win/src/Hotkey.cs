@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
@@ -8,6 +9,19 @@ namespace LanClip
     class HotkeyException : Exception
     {
         public HotkeyException(string message)
+            : base(message)
+        {
+        }
+    }
+
+    // SendInput отклонил хотя бы одно синтетическое событие клавиатуры — буфер уже
+    // наполнен (Pull() к этому моменту отработал), но нажатие клавиш физически не
+    // дошло. Отдельный тип, а не молчаливое поглощение (см. ревью задачи 24): вызов
+    // без этого исключения выглядел бы как "хоткей не работает" без единой зацепки,
+    // почему — ровно то, что этот проект ловит на каждом шагу для сетевых ошибок.
+    class PasteException : Exception
+    {
+        public PasteException(string message)
             : base(message)
         {
         }
@@ -138,11 +152,45 @@ namespace LanClip
             public IntPtr dwExtraInfo;
         }
 
+        // Зеркало нативного MOUSEINPUT — не используется этим кодом напрямую (мы шлём
+        // только клавиатурный ввод), но обязана присутствовать в union ниже: реальный
+        // Win32 INPUT — это union из MOUSEINPUT/KEYBDINPUT/HARDWAREINPUT, а её размер
+        // (наибольший среди трёх на x64 — 32 байта) и определяет истинный размер INPUT
+        // (40 байт на x64). Без неё Marshal.SizeOf(typeof(INPUT)) считал бы union по
+        // одному только KEYBDINPUT (24 байта) и отдавал бы в cbSize заниженное число —
+        // SendInput документированно отклоняет вызов целиком, если cbSize не совпадает
+        // с реальным размером структуры (найдено ревью задачи 24: каждый вызов из
+        // Send() отклонялся молча).
+        [StructLayout(LayoutKind.Sequential)]
+        struct MOUSEINPUT
+        {
+            public int dx;
+            public int dy;
+            public uint mouseData;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        // Зеркало нативного HARDWAREINPUT — как и MOUSEINPUT, не используется напрямую,
+        // нужна только для того, чтобы union целиком совпадал с реальным Win32 INPUT.
+        [StructLayout(LayoutKind.Sequential)]
+        struct HARDWAREINPUT
+        {
+            public uint uMsg;
+            public ushort wParamL;
+            public ushort wParamH;
+        }
+
         [StructLayout(LayoutKind.Explicit)]
         struct InputUnion
         {
             [FieldOffset(0)]
+            public MOUSEINPUT mi;
+            [FieldOffset(0)]
             public KEYBDINPUT ki;
+            [FieldOffset(0)]
+            public HARDWAREINPUT hi;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -155,35 +203,48 @@ namespace LanClip
         [DllImport("user32.dll", SetLastError = true)]
         static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
 
+        // Бросает PasteException, если SendInput отклонил хотя бы одно из десяти
+        // событий последовательности — но только после того, как вся
+        // последовательность целиком отправлена (см. TrySendKeyEvent): обрыв на
+        // первом отказе мог бы оставить Ctrl/Shift синтетически зажатыми без
+        // парного keyUp, а это хуже, чем ошибка, о которой узнают постфактум.
         public static void Send()
         {
+            List<string> failures = new List<string>();
+
             // Сброс физически зажатых модификаторов — см. комментарий класса.
-            SendKeyUp(VK_CONTROL);
-            SendKeyUp(VK_LCONTROL);
-            SendKeyUp(VK_RCONTROL);
-            SendKeyUp(VK_SHIFT);
-            SendKeyUp(VK_LSHIFT);
-            SendKeyUp(VK_RSHIFT);
+            TrySendKeyUp(VK_CONTROL, failures);
+            TrySendKeyUp(VK_LCONTROL, failures);
+            TrySendKeyUp(VK_RCONTROL, failures);
+            TrySendKeyUp(VK_SHIFT, failures);
+            TrySendKeyUp(VK_LSHIFT, failures);
+            TrySendKeyUp(VK_RSHIFT, failures);
 
             Thread.Sleep(ModifierResetDelayMs);
 
-            SendKeyDown(VK_CONTROL);
-            SendKeyDown(VK_V);
-            SendKeyUp(VK_V);
-            SendKeyUp(VK_CONTROL);
+            TrySendKeyDown(VK_CONTROL, failures);
+            TrySendKeyDown(VK_V, failures);
+            TrySendKeyUp(VK_V, failures);
+            TrySendKeyUp(VK_CONTROL, failures);
+
+            if (failures.Count > 0)
+            {
+                throw new PasteException("SendInput отклонил " + failures.Count
+                    + " из 10 синтетических событий клавиатуры: " + string.Join("; ", failures.ToArray()));
+            }
         }
 
-        static void SendKeyDown(int vk)
+        static void TrySendKeyDown(int vk, List<string> failures)
         {
-            SendKeyEvent(vk, 0);
+            TrySendKeyEvent(vk, 0, failures);
         }
 
-        static void SendKeyUp(int vk)
+        static void TrySendKeyUp(int vk, List<string> failures)
         {
-            SendKeyEvent(vk, KEYEVENTF_KEYUP);
+            TrySendKeyEvent(vk, KEYEVENTF_KEYUP, failures);
         }
 
-        static void SendKeyEvent(int vk, uint flags)
+        static void TrySendKeyEvent(int vk, uint flags, List<string> failures)
         {
             INPUT[] inputs = new INPUT[1];
             inputs[0] = new INPUT();
@@ -197,11 +258,15 @@ namespace LanClip
             uint sent = SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
             if (sent != 1)
             {
-                // SendInput best-effort: если система заблокировала синтетический ввод
-                // (например, UIPI — процесс с более высоким уровнем целостности перехватил
-                // фокус), продолжать посылать остальные события всё равно правильнее, чем
-                // бросать исключение на середине последовательности модификаторов — иначе
-                // Ctrl/Shift могли бы остаться зажатыми синтетически без парного keyUp.
+                // SendInput документированно отклоняет вызов целиком (возвращает 0), если
+                // cbSize не совпадает с реальным размером структуры, а также может отклонить
+                // отдельные события из-за UIPI (более защищённый процесс на переднем плане) —
+                // в обоих случаях считаем это отказом и продолжаем последовательность (не
+                // бросаем здесь же), а копим причину для Send(), который решает, поднимать
+                // ли исключение только после того, как отправлено всё до конца.
+                int error = Marshal.GetLastWin32Error();
+                string direction = (flags & KEYEVENTF_KEYUP) != 0 ? "up" : "down";
+                failures.Add("vk=0x" + vk.ToString("X2") + " " + direction + " (Win32 error " + error + ")");
             }
         }
     }

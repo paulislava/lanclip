@@ -166,9 +166,22 @@ namespace LanClip
                             result = pullClient.Pull();
                         }
 
+                        // Буфер уже наполнен на этой строке — отказ синтеза ниже не должен
+                        // маскироваться под отказ Pull() (DescribePullFailure говорит про
+                        // соседа/сеть, а не про клавиатурный ввод) и не должен проглатываться
+                        // молча (см. ревью задачи 24: недомерная структура INPUT заставляла
+                        // SendInput отклонять вообще каждый вызов без единого следа).
                         if (config.AutoPaste)
                         {
-                            Paste.Send();
+                            try
+                            {
+                                Paste.Send();
+                            }
+                            catch (Exception pasteError)
+                            {
+                                notifier.Error("Буфер обновлён, но автоматическая вставка не удалась: "
+                                    + Describe(pasteError) + ". Вставьте вручную (Ctrl+V).");
+                            }
                         }
 
                         // Успех тихий — кроме файлов, где полезно знать, что именно
@@ -366,9 +379,16 @@ namespace LanClip
                 config.ValidatePeers();
                 return config;
             }
-            catch (Exception e)
+            catch (Exception)
             {
-                Console.Error.WriteLine(ConfigErrorMessage(e, configPath));
+                // Config.ValidatePeers() бросает ровно по одной причине — пустой Peers —
+                // поэтому сообщение здесь не идёт через общий ConfigErrorMessage (который
+                // вынужден быть универсальным чеклистом из-за отсутствия типизированных
+                // кодов в Config.cs): для этого конкретного, самого частого при первом
+                // запуске случая можно и нужно дать точное однострочное сообщение с
+                // примером значения — зеркало Mac-стороннего ConfigError.noPeers.
+                Console.Error.WriteLine("Конфиг " + configPath + ": список соседей пуст. "
+                    + "Впишите адрес соседней машины в поле \"peers\", например [\"192.168.1.23\"].");
                 return null;
             }
         }
