@@ -87,6 +87,21 @@ namespace LanClip
         }
     }
 
+    // Порт вне допустимого диапазона 1..65535 — зеркало Swift-стороннего
+    // HttpServerError.invalidPort(Int): Config не валидируется автоматически перед
+    // конструированием сервера, поэтому эта проверка должна быть предсказуемым
+    // типизированным отказом, а не падать где-то глубже в HttpListener.
+    class HttpServerException : Exception
+    {
+        public readonly int Port;
+
+        public HttpServerException(int port)
+            : base("неверный порт: " + port)
+        {
+            Port = port;
+        }
+    }
+
     class HttpServer
     {
         // Приходящее тело запроса накапливается до этого предела; превышение
@@ -104,7 +119,12 @@ namespace LanClip
         readonly string hostName;
         readonly Func<PullResult> pull;
         readonly string bindHost;
-        readonly StaExecutor executor;
+
+        // Создаётся заново в каждом Start() и завершается в Stop() — иначе либо
+        // фоновый STA-поток пережил бы Stop() (утечка на весь остаток процесса), либо
+        // повторный Start() после Stop() унаследовал бы уже остановленный исполнитель
+        // и любое обращение к буферу падало бы ObjectDisposedException.
+        StaExecutor executor;
 
         HttpListener listener;
         Thread acceptThread;
@@ -130,7 +150,6 @@ namespace LanClip
             this.hostName = hostName;
             this.pull = pull;
             this.bindHost = bindHost;
-            this.executor = new StaExecutor();
         }
 
         public int BoundPort
@@ -140,6 +159,16 @@ namespace LanClip
 
         public void Start()
         {
+            // Config не валидируется автоматически перед передачей сюда (Program.cs
+            // появится только в задаче 23, и полагаться на то, что он не забудет
+            // вызвать Config.Validate(), нельзя) — без явной проверки диапазона
+            // порт вне 1..65535 дошёл бы до HttpListener необработанным
+            // HttpListenerException вместо предсказуемого типизированного отказа.
+            if (config.Port < 1 || config.Port > 65535)
+            {
+                throw new HttpServerException(config.Port);
+            }
+
             HttpListener newListener = new HttpListener();
             string prefix = "http://" + bindHost + ":" + config.Port.ToString(CultureInfo.InvariantCulture) + "/";
             newListener.Prefixes.Add(prefix);
@@ -147,6 +176,7 @@ namespace LanClip
 
             listener = newListener;
             boundPort = config.Port;
+            executor = new StaExecutor();
             running = true;
 
             acceptThread = new Thread(new ThreadStart(AcceptLoop));
@@ -184,6 +214,16 @@ namespace LanClip
             if (thread != null && thread != Thread.CurrentThread)
             {
                 thread.Join();
+            }
+
+            // Только после того, как поток приёма остановлен и присоединён — то есть
+            // новых Handle()-вызовов больше не запускается, — можно безопасно
+            // завершить исполнителя STA-потока для этого цикла Start/Stop.
+            StaExecutor currentExecutor = executor;
+            executor = null;
+            if (currentExecutor != null)
+            {
+                currentExecutor.Shutdown();
             }
         }
 
@@ -516,8 +556,13 @@ namespace LanClip
                     return true;
                 }
 
+                // Только AllowHexSpecifier, без AllowLeadingWhite/AllowTrailingWhite:
+                // NumberStyles.HexNumber включает оба этих флага и тем самым молча
+                // принимает пробелы по краям группы — Swift-сторонний Int(_:radix:)
+                // такого не допускает, разбор обязан быть не мягче эталона.
                 int first;
-                if (int.TryParse(firstGroup, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out first))
+                if (int.TryParse(firstGroup, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture,
+                    out first))
                 {
                     // Link-local: fe80::/10 (fe80..febf)
                     if (first >= 0xfe80 && first <= 0xfebf)
@@ -533,7 +578,12 @@ namespace LanClip
                 return false;
             }
 
-            string[] parts = bare.Split('.');
+            // RemoveEmptyEntries — зеркало Swift-стороннего split(separator: "."), который
+            // по умолчанию опускает пустые подпоследовательности. Без этого "127.0.0.1."
+            // (обычный хвостовой разделитель) давал бы здесь 5 частей вместо 4 и
+            // расходился бы с Swift, который трактует его как те же 4 октета и признаёт
+            // приватным.
+            string[] parts = bare.Split(new char[] { '.' }, StringSplitOptions.RemoveEmptyEntries);
             if (parts.Length != 4)
             {
                 return false;
@@ -542,8 +592,11 @@ namespace LanClip
             int[] octets = new int[4];
             for (int i = 0; i < 4; i++)
             {
+                // AllowLeadingSign без AllowLeadingWhite/AllowTrailingWhite: NumberStyles.Integer
+                // включает оба этих флага и тем самым молча принимает пробелы по краям
+                // октета — Swift-сторонний Int(String) такого не допускает.
                 int value;
-                if (!int.TryParse(parts[i], NumberStyles.Integer, CultureInfo.InvariantCulture, out value)
+                if (!int.TryParse(parts[i], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out value)
                     || value < 0 || value > 255)
                 {
                     return false;

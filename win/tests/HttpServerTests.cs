@@ -105,6 +105,20 @@ namespace LanClip.Tests
                 T.Eq(403, response.Status, "status");
             });
 
+            // Регрессия: Swift-сторонний split(separator: ".") по умолчанию опускает
+            // пустые подпоследовательности, поэтому хвостовая точка "127.0.0.1." там
+            // по-прежнему даёт 4 октета и признаётся приватным адресом. До починки
+            // C#-разбор без RemoveEmptyEntries давал 5 частей и отвергал такой адрес —
+            // платформы расходились на границе безопасности.
+            T.Run("trailing dot in ipv4 remote is still private like on Swift side", delegate
+            {
+                FakeClipboard clipboard = new FakeClipboard();
+                HttpResponseSpec response = HttpServer.Route(
+                    Req("GET", "/health", TestToken), MakeConfig(), MakeStore(clipboard),
+                    "win", "127.0.0.1.", new Func<PullResult>(SucceedingPull));
+                T.Eq(200, response.Status, "status");
+            });
+
             T.Run("bad token returns 401", delegate
             {
                 FakeClipboard clipboard = new FakeClipboard();
@@ -275,6 +289,67 @@ namespace LanClip.Tests
 
         static void RegisterEndToEndTests()
         {
+            T.Run("start with out of range port throws instead of crashing", delegate
+            {
+                // Config не валидируется автоматически перед конструированием сервера —
+                // защита должна бросать типизированную ошибку, а не отдавать необработанное
+                // исключение из HttpListener где-то глубже.
+                Config config = MakeConfig();
+                config.Port = 100000;
+                FakeClipboard clipboard = new FakeClipboard();
+                HttpServer server = new HttpServer(config, MakeStore(clipboard), "win",
+                    new Func<PullResult>(SucceedingPull), "127.0.0.1");
+
+                try
+                {
+                    server.Start();
+                    T.True(false, "expected HttpServerException");
+                }
+                catch (HttpServerException e)
+                {
+                    T.Eq(100000, e.Port, "reported port");
+                }
+            });
+
+            T.Run("restart cycle reacquires a port", delegate
+            {
+                // Доказывает, что последовательный Start() -> Stop() -> Start() -> Stop()
+                // остаётся рабочим после того, как исполнитель STA-потока стал создаваться
+                // заново в Start() и завершаться в Stop() (иначе повторный Start() унаследовал
+                // бы уже остановленный исполнитель, и любой запрос падал бы ObjectDisposedException).
+                FakeClipboard clipboard = new FakeClipboard();
+                SnapshotStore store = MakeStore(clipboard);
+                Config config = MakeConfig();
+                config.Port = FindFreePort();
+                HttpServer server = new HttpServer(config, store, "win", new Func<PullResult>(SucceedingPull),
+                    "127.0.0.1");
+
+                server.Start();
+                int firstPort = server.BoundPort;
+                T.True(firstPort != 0, "first port bound");
+                server.Stop();
+
+                config.Port = FindFreePort();
+                server.Start();
+                int secondPort = server.BoundPort;
+                T.True(secondPort != 0, "second port bound");
+                try
+                {
+                    HttpWebRequest request = (HttpWebRequest)WebRequest.Create(
+                        "http://127.0.0.1:" + secondPort + "/health");
+                    request.Method = "GET";
+                    request.Headers["X-Clip-Token"] = TestToken;
+                    using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+                    {
+                        T.Eq(200, (int)response.StatusCode, "status after restart");
+                    }
+                }
+                finally
+                {
+                    server.Stop();
+                }
+            });
+
             T.Run("end to end clip round trip with and without token", delegate
             {
                 FakeClipboard clipboard = new FakeClipboard();
