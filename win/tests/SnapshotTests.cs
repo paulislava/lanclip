@@ -9,7 +9,7 @@ namespace LanClip.Tests
     // ровно семь случаев — тест на симлинк-снаружи-папки туда сознательно не входит
     // (создание симлинков на Windows требует Developer Mode/повышенных прав и сделало
     // бы прогон нестабильным); сама защита от расхождения "размер vs байты" всё равно
-    // заложена в Snapshot.cs — см. ResolvePath в SnapshotStore.
+    // заложена в Snapshot.cs — см. CanonicalizeForBothReads в SnapshotStore.
     static class SnapshotTests
     {
         public static void Register()

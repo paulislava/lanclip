@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 
 namespace LanClip
@@ -83,11 +84,12 @@ namespace LanClip
 
                 if (error != null)
                 {
-                    // Перебрасываем исходное исключение как есть вызывающему —
-                    // тип и сообщение сохраняются, теряется только тот кусок стека,
-                    // что был внутри STA-потока (ExceptionDispatchInfo появился
-                    // только в .NET 4.5, здесь недоступен).
-                    throw error;
+                    // ExceptionDispatchInfo — тип библиотеки (mscorlib, с .NET 4.5), а
+                    // не языковая конструкция C# 6+, поэтому доступен и под csc.exe
+                    // (целевой рантайм — .NET Framework 4.8). Capture/Throw сохраняет
+                    // исходный стек целиком, включая кадры внутри body() на STA-потоке,
+                    // а не только тип и сообщение исключения.
+                    ExceptionDispatchInfo.Capture(error).Throw();
                 }
                 return result;
             }

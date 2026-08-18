@@ -10,11 +10,13 @@ namespace LanClip
     //  1. Относительные пути строятся из позиции обхода (relPrefix + "/" + имя),
     //     а не вычитанием префикса из полного пути — так temp-каталог, зарезолвленный
     //     через junction/подставленный диск, не даёт мусора в rel.
-    //  2. Размер и отдаваемые байты берутся с одного и того же разрешённого пути:
-    //     Expand() резолвит путь один раз (ResolvePath) и кладёт этот же путь и в
-    //     BlobRef.Size (через FileInfo), и в Sources (для последующего чтения в Blob()).
-    //     Расхождение между "что посчитали" и "что прочитали" структурно невозможно —
-    //     это один и тот же путь.
+    //  2. Размер и отдаваемые байты берутся из одной и той же строки пути: Expand()
+    //     вычисляет её один раз (CanonicalizeForBothReads — чисто лексическая
+    //     нормализация, не разыменование symlink/junction) и кладёт эту же строку и
+    //     в BlobRef.Size (через FileInfo), и в Sources (для последующего чтения в
+    //     Blob()). Расхождение между "что посчитали" и "что прочитали" структурно
+    //     невозможно — это буквально один и тот же путь, а не два разных API с
+    //     разным поведением на symlink, как было в исходном Swift-баге.
 
     class ClipSnapshot
     {
@@ -131,7 +133,7 @@ namespace LanClip
                     blob.Rel = rel;
                     blob.Size = entry.Size;
 
-                    sources[blobs.Count] = entry.ResolvedPath;
+                    sources[blobs.Count] = entry.AbsolutePath;
                     blobs.Add(blob);
                 }
             }
@@ -149,7 +151,7 @@ namespace LanClip
 
         struct Entry
         {
-            public string ResolvedPath;
+            public string AbsolutePath;
             public string Rel;
             public long Size;
         }
@@ -160,11 +162,11 @@ namespace LanClip
 
             if (File.Exists(path))
             {
-                string resolved = ResolvePath(path);
+                string absolute = CanonicalizeForBothReads(path);
                 Entry entry = new Entry();
-                entry.ResolvedPath = resolved;
+                entry.AbsolutePath = absolute;
                 entry.Rel = Path.GetFileName(path);
-                entry.Size = new FileInfo(resolved).Length;
+                entry.Size = new FileInfo(absolute).Length;
                 entries.Add(entry);
                 return entries;
             }
@@ -185,11 +187,11 @@ namespace LanClip
         {
             foreach (string filePath in Directory.GetFiles(dir))
             {
-                string resolved = ResolvePath(filePath);
+                string absolute = CanonicalizeForBothReads(filePath);
                 Entry entry = new Entry();
-                entry.ResolvedPath = resolved;
+                entry.AbsolutePath = absolute;
                 entry.Rel = relPrefix + "/" + Path.GetFileName(filePath);
-                entry.Size = new FileInfo(resolved).Length;
+                entry.Size = new FileInfo(absolute).Length;
                 entries.Add(entry);
             }
 
@@ -200,10 +202,15 @@ namespace LanClip
             }
         }
 
-        // Разрешает путь один раз; и размер (FileInfo), и байты (File.ReadAllBytes в
-        // Blob()) берутся именно из этой строки — расхождение между объявленным
-        // размером и прочитанным содержимым структурно исключено.
-        static string ResolvePath(string path)
+        // ВАЖНО: это чисто лексическая нормализация (Path.GetFullPath убирает "..",
+        // ".", относительность), а не разыменование symlink/junction — аналога
+        // Swift-стороннего resolvingSymlinksInPath() в .NET Framework 4.0 без P/Invoke
+        // нет. Согласованность размера и байтов держится не на этом: она держится на
+        // том, что ОДНА И ТА ЖЕ возвращённая строка кладётся и в Entry.AbsolutePath
+        // (источник для File.ReadAllBytes в Blob()), и передаётся в FileInfo(...).Length
+        // для BlobRef.Size — расхождение между объявленным размером и прочитанными
+        // байтами структурно исключено именно поэтому, а не потому что путь "разрешён".
+        static string CanonicalizeForBothReads(string path)
         {
             return Path.GetFullPath(path);
         }

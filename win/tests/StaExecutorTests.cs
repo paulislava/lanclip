@@ -69,6 +69,43 @@ namespace LanClip.Tests
                 }
             });
 
+            T.Run("propagated exception keeps its sta-side stack frame", delegate
+            {
+                // ExceptionDispatchInfo.Capture/Throw должен сохранить не только тип
+                // и сообщение, но и сам стек, накопленный внутри STA-потока — иначе
+                // отладка отказов буфера в задачах 19/22 потеряет ровно тот кадр,
+                // который указывает, где внутри тела реально бросило.
+                StaExecutor executor = new StaExecutor();
+                try
+                {
+                    InvalidOperationException caught = null;
+                    try
+                    {
+                        executor.Invoke(new Func<int>(delegate
+                        {
+                            return ThrowFromStaSide();
+                        }));
+                    }
+                    catch (InvalidOperationException e)
+                    {
+                        caught = e;
+                    }
+
+                    T.True(caught != null, "exception was caught");
+                    if (caught != null)
+                    {
+                        T.Eq("бум со стороны STA", caught.Message, "message preserved");
+                        T.True(caught.StackTrace != null
+                            && caught.StackTrace.IndexOf("ThrowFromStaSide") >= 0,
+                            "stack trace still names the sta-side throwing frame");
+                    }
+                }
+                finally
+                {
+                    executor.Shutdown();
+                }
+            });
+
             T.Run("invoke after shutdown throws", delegate
             {
                 StaExecutor executor = new StaExecutor();
@@ -101,6 +138,14 @@ namespace LanClip.Tests
                     executor.Shutdown();
                 }
             });
+        }
+
+        // Отдельный именованный метод (а не только анонимный делегат) специально
+        // для того, чтобы его имя было видно в StackTrace пойманного исключения —
+        // так тест на сохранение стека проверяет что-то конкретное, а не пустоту.
+        static int ThrowFromStaSide()
+        {
+            throw new InvalidOperationException("бум со стороны STA");
         }
     }
 }
