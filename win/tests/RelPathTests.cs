@@ -49,6 +49,25 @@ namespace LanClip.Tests
                 T.Eq("com1.txt_", RelPath.Normalize("com1.txt"), "com1.txt");
             });
 
+            // MARK: - Мелкая находка финального ревью: ".con" нормализовался по-разному на двух платформах
+
+            // Реальный Windows считает "имя до первой точки" пустой строкой для
+            // файла с ведущей точкой (не "con") — эта реализация уже вела себя
+            // так (IndexOf('.') == 0 -> baseName == ""), Swift-сторонняя раньше
+            // расходилась (split отбрасывал пустую ведущую подпоследовательность,
+            // получая base == "con"). Тест фиксирует уже верное поведение и
+            // защищает от регрессии при будущей правке.
+            T.Run("leading dot before reserved name is not treated as reserved", delegate
+            {
+                T.Eq(".con", RelPath.Normalize(".con"), "single leading dot");
+                T.Eq("..con", RelPath.Normalize("..con"), "double leading dot");
+            });
+
+            T.Run("reserved name without leading dot is still suffixed", delegate
+            {
+                T.Eq("con_", RelPath.Normalize("con"), "no leading dot");
+            });
+
             T.Run("rejects reserved name exceeding limit after suffix", delegate
             {
                 string overLimit = "nul." + new string('a', 146);

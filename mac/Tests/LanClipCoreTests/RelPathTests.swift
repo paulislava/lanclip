@@ -36,6 +36,24 @@ final class RelPathTests: XCTestCase {
         XCTAssertEqual(RelPath.normalize("com1.txt"), "com1.txt_")
     }
 
+    // MARK: - Мелкая находка финального ревью: ".con" нормализовался по-разному на двух платформах
+
+    /// Раньше `split(separator: ".")` отбрасывал ведущую пустую подпоследовательность,
+    /// поэтому база `".con"` считалась равной `"con"` (ложное срабатывание
+    /// зарезервированного имени) — реальный Windows же считает "имя до первой
+    /// точки" пустой строкой для файла с ведущей точкой, не "con", и файл не
+    /// трогает. Файл приезжал на две машины под разными именами
+    /// (`.con` на Windows, `.con_` на Mac).
+    func testLeadingDotBeforeReservedNameIsNotTreatedAsReserved() {
+        XCTAssertEqual(RelPath.normalize(".con"), ".con")
+        XCTAssertEqual(RelPath.normalize("..con"), "..con")
+    }
+
+    /// Контроль: без ведущей точки то же самое имя по-прежнему зарезервировано.
+    func testReservedNameWithoutLeadingDotIsStillSuffixed() {
+        XCTAssertEqual(RelPath.normalize("con"), "con_")
+    }
+
     func testRejectsReservedNameExceedingLimitAfterSuffix() {
         let overLimit = "nul." + String(repeating: "a", count: 146)
         XCTAssertNil(RelPath.normalize(overLimit))

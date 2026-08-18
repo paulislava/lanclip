@@ -63,7 +63,22 @@ public enum RelPath {
 
         guard !cleaned.isEmpty else { return nil }
 
-        let base = cleaned.split(separator: ".", maxSplits: 1).first.map(String.init) ?? cleaned
+        // Мелкая находка финального ревью: `split(separator: ".")` по умолчанию
+        // ОТБРАСЫВАЕТ пустые подпоследовательности, поэтому для `".con"` (ведущая
+        // точка) `base` получался равным "con" — реальный Windows так реестр
+        // имён не проверяет: там "имя до первой точки" для `.con` — ПУСТАЯ строка
+        // (точка стоит на нулевой позиции), а не "con". Из-за этого `.con`
+        // ошибочно распознавался как зарезервированное имя и получал суффикс
+        // (`.con_`), а Windows-сторонняя реализация (индекс первой точки, без
+        // отбрасывания пустых кусков) корня не трогала вовсе — один и тот же файл
+        // приезжал на две машины под разными именами. Взят явный индекс первой
+        // точки — так же, как на Windows-стороне (`RelPath.cs`), — вместо `split`.
+        let base: String
+        if let dotIndex = cleaned.firstIndex(of: ".") {
+            base = String(cleaned[cleaned.startIndex..<dotIndex])
+        } else {
+            base = cleaned
+        }
         if reserved.contains(base.lowercased()) {
             cleaned += "_"
         }
