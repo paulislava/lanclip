@@ -32,6 +32,29 @@ function Write-Step {
     Write-Host "==> $Message"
 }
 
+# IPv4-адрес + длина префикса -> адрес сети в CIDR-нотации ("192.168.1.184",
+# 24 -> "192.168.1.0/24"). Нужна для правила файрвола (Шаг 6): вместо
+# встроенного ключевого слова "LocalSubnet" (оно объединяет подсети ВСЕХ
+# активных адаптеров машины, включая виртуальные — см. комментарий у Шага 6)
+# правило получает точную подсеть одного конкретного физического адаптера,
+# вычисленную на месте.
+function Get-Ipv4NetworkCidr {
+    param([string]$IPAddress, [int]$PrefixLength)
+    $ipBytes = [System.Net.IPAddress]::Parse($IPAddress).GetAddressBytes()
+    $maskBytes = New-Object byte[] 4
+    for ($i = 0; $i -lt 4; $i++) {
+        $bitsInByte = [Math]::Min(8, [Math]::Max(0, $PrefixLength - ($i * 8)))
+        if ($bitsInByte -gt 0) {
+            $maskBytes[$i] = [byte](256 - [Math]::Pow(2, 8 - $bitsInByte))
+        }
+    }
+    $networkBytes = New-Object byte[] 4
+    for ($i = 0; $i -lt 4; $i++) {
+        $networkBytes[$i] = $ipBytes[$i] -band $maskBytes[$i]
+    }
+    return ($networkBytes -join ".") + "/" + $PrefixLength
+}
+
 # --- Права администратора: urlacl и правило файрвола без них не поставить. ---
 $principal = New-Object Security.Principal.WindowsPrincipal(
     [Security.Principal.WindowsIdentity]::GetCurrent())
@@ -204,22 +227,55 @@ Write-Host "    готово"
 # Private — а адаптер к тому же может снова переклассифицироваться сам при
 # следующем переподключении, и придётся гоняться за этим бесконечно.
 #
-# Вместо этого сужаю правило по адресу источника через встроенное ключевое
-# слово "LocalSubnet" (а не буквальную "192.168.1.0/24"): Windows Firewall
-# вычисляет его динамически из фактической маски подсети активного
-# интерфейса на момент каждого соединения — правило продолжит корректно
-# работать, даже если роутер когда-нибудь выдаст другую подсеть, без ручной
-# правки. Итог: порт открыт независимо от профиля сети, но трафик всё равно
-# принимается только из локальной подсети машины — плюс токен как второй
-# рубеж поверх этого.
-Write-Step "Правило файрвола: TCP $Port, вход, любой профиль, только LocalSubnet"
+# Вместо этого сужаю правило по адресу источника — НЕ встроенным ключевым
+# словом "LocalSubnet". Проверка на этой же машине показала, что LocalSubnet
+# вычисляется как ОБЪЕДИНЕНИЕ подсетей ВСЕХ активных адаптеров сразу — на
+# этом ПК их несколько одновременно (реальный Wi-Fi, vEthernet(WSL),
+# happ-tun, при активном подключении ещё и OpenVPN TAP), и часть из них уже
+# сегодня сидит в приватных диапазонах (10/8, 172.16/12), которые
+# HttpServer.IsPrivateAddress тоже сочтёт "приватными". LocalSubnet впустил
+# бы трафик из подсети VPN/туннеля наравне с настоящей LAN, а при роуминге
+# машины в чужую сеть — из ЭТОЙ чужой сети тоже (та же угроза, из-за которой
+# первая правка вообще понадобилась).
+#
+# Поэтому вычисляю точную подсеть одного конкретного адаптера — физического
+# (Get-NetAdapter -> Virtual = $false, у виртуальных коммутаторов/VPN/TAP
+# всегда $true) и поднятого (Status = Up). Если такой адаптер не находится
+# однозначно (ни одного или больше одного) — останавливаюсь с понятной
+# ошибкой вместо того, чтобы разрешить лишнее по догадке. Подсеть
+# пересчитывается заново при каждой установке, так что смена адресации
+# роутером не требует правки скрипта.
+Write-Step "Определение локальной подсети для правила файрвола"
+$lanAdapters = @(Get-NetAdapter | Where-Object { -not $_.Virtual -and $_.Status -eq "Up" })
+if ($lanAdapters.Count -eq 0) {
+    Write-Error "Не нашлось ни одного физического (невиртуального) сетевого адаптера в состоянии Up — не могу определить локальную подсеть для правила файрвола. Впишите её вручную и адаптируйте скрипт."
+    exit 1
+}
+if ($lanAdapters.Count -gt 1) {
+    $names = ($lanAdapters | ForEach-Object { "$($_.Name) ($($_.InterfaceDescription))" }) -join "; "
+    Write-Error "Найдено больше одного физического активного адаптера — не могу однозначно выбрать LAN-подсеть: $names. Впишите нужную подсеть в правило файрвола вручную."
+    exit 1
+}
+
+$lanAdapter = $lanAdapters[0]
+$lanIP = Get-NetIPAddress -InterfaceIndex $lanAdapter.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object { $_.IPAddress -notlike "169.254.*" } | Select-Object -First 1
+if (-not $lanIP) {
+    Write-Error "У адаптера '$($lanAdapter.Name)' нет обычного IPv4-адреса (только APIPA 169.254.x.x или его нет вовсе) — не могу вычислить подсеть для правила файрвола."
+    exit 1
+}
+
+$lanSubnet = Get-Ipv4NetworkCidr -IPAddress $lanIP.IPAddress -PrefixLength $lanIP.PrefixLength
+Write-Host "    адаптер: $($lanAdapter.Name) ($($lanAdapter.InterfaceDescription)), подсеть: $lanSubnet"
+
+Write-Step "Правило файрвола: TCP $Port, вход, любой профиль, только из $lanSubnet"
 $existingRule = Get-NetFirewallRule -DisplayName $FirewallDisplayName -ErrorAction SilentlyContinue
 if ($existingRule) {
     Write-Host "    уже существует — пересоздаю"
     $existingRule | Remove-NetFirewallRule
 }
 New-NetFirewallRule -DisplayName $FirewallDisplayName -Direction Inbound -LocalPort $Port `
-    -Protocol TCP -Action Allow -Profile Any -RemoteAddress LocalSubnet | Out-Null
+    -Protocol TCP -Action Allow -Profile Any -RemoteAddress $lanSubnet | Out-Null
 Write-Host "    готово"
 
 # --- Шаг 7: задача планировщика. ---
@@ -279,22 +335,49 @@ Write-Host "    зарегистрирована"
 # --- Шаг 8: запуск и проверка, что процесс реально держится. ---
 #
 # Код возврата Register-ScheduledTask/Start-ScheduledTask подтверждает только
-# то, что планировщик принял задание — не то, что процесс поднялся и не ушёл
-# в перезапуск (например, из-за конфига, который serve отверг бы на старте,
-# или из-за неудавшейся регистрации хоткея). Поэтому здесь опрашиваем
-# состояние задачи, наличие процесса и локально дёргаем /health — все три
-# признака вместе, а не полагаемся на код возврата.
-Write-Step "Запуск задачи и проверка, что агент поднялся"
+# то, что планировщик принял задание — не то, что процесс поднялся, слушает
+# порт и отвечает (например, из-за конфига, который serve отверг бы на
+# старте, из-за неудавшейся регистрации хоткея, или просто потому что
+# HttpListener ещё не успел завершить привязку сокета). Поэтому здесь
+# опрашиваем все три признака — состояние задачи, наличие процесса и
+# локальный /health — В ОДНОМ цикле повторов, а не полагаемся на код
+# возврата и не проверяем /health однократно уже после того, как цикл для
+# задачи/процесса завершился: холодный старт сразу после копирования
+# свежего бинарника (антивирус может ещё его проверять) или просто чуть более
+# долгая привязка сокета — не повод ронять корректную установку из-за
+# секундного зазора в таймингах.
+Write-Step "Запуск задачи и проверка, что агент поднялся (задача, процесс, /health)"
 Start-ScheduledTask -TaskName $TaskName
 
 $taskRunning = $false
 $processAlive = $false
-for ($attempt = 1; $attempt -le 10; $attempt++) {
+$healthOk = $false
+$healthDetail = "проверка ещё не выполнялась"
+for ($attempt = 1; $attempt -le 15; $attempt++) {
     Start-Sleep -Seconds 1
     $state = (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue).State
     $taskRunning = ($state -eq "Running")
     $processAlive = [bool](Get-Process -Name "lanclipd" -ErrorAction SilentlyContinue)
+
     if ($taskRunning -and $processAlive) {
+        try {
+            $configText = [IO.File]::ReadAllText($ConfigFile)
+            if ($configText -match '"token"\s*:\s*"([0-9a-f]+)"') {
+                $localToken = $Matches[1]
+                $response = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" `
+                    -Headers @{ "X-Clip-Token" = $localToken } -UseBasicParsing -TimeoutSec 5
+                $healthOk = ($response.StatusCode -eq 200)
+                $healthDetail = "статус ответа: $($response.StatusCode)"
+            } else {
+                $healthDetail = "конфиг прочитан, но в нём не нашёлся токен"
+            }
+        } catch {
+            $healthOk = $false
+            $healthDetail = "исключение: $($_.Exception.Message)"
+        }
+    }
+
+    if ($taskRunning -and $processAlive -and $healthOk) {
         break
     }
 }
@@ -307,35 +390,12 @@ if (-not $processAlive) {
     Write-Error "Задача Running, но процесс lanclipd не найден — похоже, ушёл в перезапуск сразу после старта. Установка не завершена."
     exit 1
 }
-
-# Локальная проверка /health — не подтверждает доступность с Mac (это
-# отдельная проверка с той машины, см. отчёт задачи), но подтверждает, что
-# HTTP-сервер реально слушает порт и отвечает валидным JSON. Задача Running и
-# процесс жив — сигналы мягкие (процесс мог подняться и тут же зависнуть на
-# биндинге сокета); сервер, который слушает порт, но не отвечает — самый
-# вероятный настоящий отказ (конфликт порта, кривой конфиг), поэтому эта
-# проверка гейтится так же жёстко, как предыдущие две, а не только
-# предупреждением.
-$healthOk = $false
-$healthDetail = "конфиг не удалось прочитать или в нём нет токена"
-try {
-    $configText = [IO.File]::ReadAllText($ConfigFile)
-    if ($configText -match '"token"\s*:\s*"([0-9a-f]+)"') {
-        $localToken = $Matches[1]
-        $response = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" `
-            -Headers @{ "X-Clip-Token" = $localToken } -UseBasicParsing -TimeoutSec 5
-        $healthOk = ($response.StatusCode -eq 200)
-        $healthDetail = "статус ответа: $($response.StatusCode)"
-    }
-} catch {
-    $healthDetail = "исключение: $($_.Exception.Message)"
-}
-
+$attemptsUsed = [Math]::Min($attempt, 15)
 if (-not $healthOk) {
-    Write-Error "Локальный /health не ответил 200 ($healthDetail) — задача Running и процесс жив, но сервер не обслуживает запросы. Установка не завершена."
+    Write-Error "Локальный /health так и не ответил 200 за $attemptsUsed попыток ($healthDetail) — задача Running и процесс жив, но сервер не обслуживает запросы. Установка не завершена."
     exit 1
 }
-Write-Host "    /health локально отвечает 200"
+Write-Host "    /health локально отвечает 200 (попытка $attemptsUsed из 15)"
 
 Write-Host ""
 Write-Host "Готово. lanclipd поставлен в $BinDest, задача '$TaskName' зарегистрирована и запущена (state=Running)."
