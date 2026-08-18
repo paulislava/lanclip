@@ -126,6 +126,34 @@ final class StagingTests: XCTestCase {
         }
     }
 
+    /// Ревьюер второго раунда: если под симлинком-побегом есть ещё хотя бы один
+    /// несуществующий сегмент (`sub/deeper/evil.txt`, `sub` ведёт наружу, `deeper` ещё
+    /// не создан), безусловный `createDirectory(withIntermediateDirectories: true)` по
+    /// всему пути физически создал бы `deeper` СНАРУЖИ партии ещё до того, как отказ
+    /// успел бы сработать. Проверяем не только сам отказ, но и то, что в каталоге вне
+    /// партии реально ничего не появилось — иначе тест не отличит нынешнее поведение
+    /// от старого дырявого.
+    func testDestinationRejectsPathThroughSymlinkWithUncreatedSegmentBeneath() throws {
+        let outside = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("lanclip-staging-outside-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outside) }
+
+        let staging = Staging(root: root, now: { self.fixedDate() })
+        let batch = try staging.newBatch()
+
+        let symlink = batch.root.appendingPathComponent("sub")
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: outside)
+
+        XCTAssertThrowsError(try batch.destination(for: "sub/deeper/evil.txt")) { error in
+            XCTAssertEqual(error as? StagingError, .unsafeRelativePath("sub/deeper/evil.txt"))
+        }
+
+        let escapedDirectory = outside.appendingPathComponent("deeper")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: escapedDirectory.path),
+                        "каталог не должен физически создаваться снаружи партии")
+    }
+
     /// Контроль к предыдущему тесту: починка не должна запрещать обычные вложенные
     /// пути без симлинков — только те, что реально выходят за пределы партии.
     func testDestinationStillSucceedsForNestedPathWithoutSymlinks() throws {

@@ -19,28 +19,45 @@ public struct StagingBatch {
     /// (например, `root/sub` в реальности указывает на `/etc`), кандидат
     /// `root/sub/passwd` текстуально лежит внутри `root` и прошёл бы лексическую
     /// проверку, но `createDirectory`/запись на диск ушли бы по ссылке наружу.
-    /// Поэтому сравнение ведётся по `resolvingSymlinksInPath()` — но разрешать можно
-    /// только то, что уже существует на диске, а сам файл ещё не создан, поэтому
-    /// разрешается каталог, в котором файл будет лежать, и порядок важен: сначала
-    /// создать промежуточные каталоги, потом разрешить и проверить. Если после этого
-    /// разрешённый путь оказался за пределами `root` — отказ; уже созданные каталоги
-    /// специально не откатываются: партия целиком временная и уборка (`cleanup()`)
-    /// сама уберёт её позже.
+    ///
+    /// Проверять нужно самого глубокого УЖЕ СУЩЕСТВУЮЩЕГО предка целевого каталога,
+    /// а не сам целевой каталог после его создания: `createDirectory(withIntermediateDirectories:
+    /// true)` одним вызовом создал бы недостающие компоненты по пути ещё ДО проверки —
+    /// и если под симлинком есть хотя бы один несуществующий сегмент (`sub/deeper/evil.txt`,
+    /// где `sub` ведёт наружу, а `deeper` ещё не существует), этот вызов физически создал бы
+    /// `deeper` в чужом каталоге, и только потом сработал бы отказ. Пройти сквозь симлинк
+    /// можно лишь по уже существующему компоненту — так что проверка такого предка
+    /// закрывает дыру полностью: компоненты, которые создаёт код сам (после проверки),
+    /// это настоящие каталоги, а не ссылки, новых путей наружу они не открывают.
+    ///
+    /// `root` сам обычно лежит под симлинком на macOS (`/var` -> `/private/var`), поэтому
+    /// сравнение ведётся между двумя РАЗРЕШЁННЫМИ путями — иначе неразрешённый `root`
+    /// отвергал бы вообще всё.
     public func destination(for rel: String) throws -> URL {
         guard let normalized = RelPath.normalize(rel) else {
             throw StagingError.unsafeRelativePath(rel)
         }
 
+        let fileManager = FileManager.default
         let candidate = root.appendingPathComponent(normalized)
         let candidateDirectory = candidate.deletingLastPathComponent()
 
-        try FileManager.default.createDirectory(at: candidateDirectory, withIntermediateDirectories: true)
+        var existingAncestor = candidateDirectory
+        while !fileManager.fileExists(atPath: existingAncestor.path) {
+            let parent = existingAncestor.deletingLastPathComponent()
+            guard parent.path != existingAncestor.path else { break } // достигли корня файловой системы
+            existingAncestor = parent
+        }
 
         let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL.path
-        let resolvedDirectory = candidateDirectory.resolvingSymlinksInPath().standardizedFileURL.path
-        guard resolvedDirectory == resolvedRoot || resolvedDirectory.hasPrefix(resolvedRoot + "/") else {
+        let resolvedAncestor = existingAncestor.resolvingSymlinksInPath().standardizedFileURL.path
+        guard resolvedAncestor == resolvedRoot || resolvedAncestor.hasPrefix(resolvedRoot + "/") else {
             throw StagingError.unsafeRelativePath(rel)
         }
+
+        // Проверка прошла: все существующие предки лежат внутри партии, поэтому
+        // теперь безопасно создать недостающие компоненты одним вызовом.
+        try fileManager.createDirectory(at: candidateDirectory, withIntermediateDirectories: true)
 
         return candidate
     }
