@@ -29,7 +29,10 @@ public enum RelPath {
 
         guard !components.isEmpty else { return nil }
         let joined = components.joined(separator: "/")
-        guard joined.count <= maxTotal else { return nil }
+        // Байты UTF-8, не графемы: та же единица, что и на Windows-стороне
+        // (см. RelPath.cs) — иначе платформы расходятся на одном и том же
+        // входе (эмодзи, иероглифы из дополнительных плоскостей Unicode).
+        guard joined.utf8.count <= maxTotal else { return nil }
         return joined
     }
 
@@ -55,7 +58,8 @@ public enum RelPath {
             cleaned += "_"
         }
 
-        guard cleaned.count <= maxComponent else { return nil }
+        // Байты UTF-8, не графемы (см. комментарий в normalize(_:)).
+        guard cleaned.utf8.count <= maxComponent else { return nil }
         return cleaned
     }
 }

@@ -1,4 +1,5 @@
 using System;
+using System.Text;
 
 namespace LanClip.Tests
 {
@@ -78,6 +79,55 @@ namespace LanClip.Tests
                 T.Eq(null, RelPath.Normalize(""), "empty string");
                 T.Eq(null, RelPath.Normalize("./././"), "only dot components");
             });
+
+            // Длина компонента и итогового пути считается в байтах UTF-8, а не в
+            // кодовых единицах UTF-16 (string.Length) и не в графемных кластерах
+            // (Swift .count) — иначе платформы расходятся на одном и том же входе:
+            // "\U0001F44B" ("👋") — 1 графема, 2 code unit-а UTF-16, но 4 байта UTF-8.
+
+            T.Run("accepts emoji component at exact byte limit", delegate
+            {
+                // 37 * 4 = 148 байт + "ab" (2 байта) = 150 байт — ровно на границе.
+                string component = Repeat("\U0001F44B", 37) + "ab";
+                T.Eq(component, RelPath.Normalize(component), "emoji component at byte limit");
+            });
+
+            T.Run("rejects emoji component one byte over limit", delegate
+            {
+                // 38 эмодзи = 152 байта UTF-8, но лишь 76 code unit-ов UTF-16 —
+                // старая C#-реализация (string.Length <= 150) это принимала.
+                string component = Repeat("\U0001F44B", 38);
+                T.Eq(null, RelPath.Normalize(component), "emoji component over byte limit");
+            });
+
+            T.Run("rejects emoji component reported by review", delegate
+            {
+                // Ровно тот вход, на котором платформы расходились: 76 эмодзи —
+                // 152 code unit-а UTF-16 (C# .Length > 150 — отвергал), но 76 графем
+                // (Swift .count <= 150 — принимал). В байтах UTF-8 это 304 байта:
+                // обе стороны теперь одинаково отвергают.
+                string component = Repeat("\U0001F44B", 76);
+                T.Eq(null, RelPath.Normalize(component), "emoji component reported by review");
+            });
+
+            T.Run("rejects cyrillic component exceeding byte limit", delegate
+            {
+                // 80 кириллических букв — 80 code unit-ов UTF-16 и 80 графем (обе
+                // старые реализации это принимали), но 160 байт UTF-8 — отказ.
+                // Осознанное ужесточение, не регрессия.
+                string component = Repeat("а", 80);
+                T.Eq(null, RelPath.Normalize(component), "cyrillic component over byte limit");
+            });
+        }
+
+        static string Repeat(string value, int count)
+        {
+            StringBuilder builder = new StringBuilder(value.Length * count);
+            for (int i = 0; i < count; i++)
+            {
+                builder.Append(value);
+            }
+            return builder.ToString();
         }
     }
 }

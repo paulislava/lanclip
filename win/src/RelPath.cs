@@ -50,7 +50,13 @@ namespace LanClip
         // 4. санитизация запрещённых символов и управляющих символов в "_"
         // 5. обрезка хвостовых точек и пробелов
         // 6. суффикс "_" к зарезервированным именам — ДО проверки длины компонента
-        // 7. отказ при компоненте длиннее MaxComponent или итоговом пути длиннее MaxTotal
+        // 7. отказ при компоненте длиннее MaxComponent или итоговом пути длиннее
+        //    MaxTotal — длина считается в БАЙТАХ UTF-8 (Encoding.UTF8.GetByteCount),
+        //    не в кодовых единицах UTF-16 (string.Length) и не в графемах, как на
+        //    Swift-стороне (String.count/utf8.count) — иначе платформы расходятся
+        //    на одном и том же входе (например, эмодзи или иероглифы из
+        //    дополнительных плоскостей Unicode: 1 графема = 2 code unit-а UTF-16 =
+        //    4 байта UTF-8).
         public static string Normalize(string raw)
         {
             string unified = raw.Replace("\\", "/");
@@ -81,7 +87,7 @@ namespace LanClip
             }
 
             string joined = string.Join("/", components.ToArray());
-            if (joined.Length > MaxTotal)
+            if (Encoding.UTF8.GetByteCount(joined) > MaxTotal)
             {
                 return null;
             }
@@ -121,7 +127,7 @@ namespace LanClip
                 cleaned = cleaned + "_";
             }
 
-            if (cleaned.Length > MaxComponent)
+            if (Encoding.UTF8.GetByteCount(cleaned) > MaxComponent)
             {
                 return null;
             }
