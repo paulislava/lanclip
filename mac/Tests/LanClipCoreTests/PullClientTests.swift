@@ -34,19 +34,47 @@ private final class FakeProber: HealthProbing, @unchecked Sendable {
 private final class FakeFetcher: BlobFetching, @unchecked Sendable {
     private let lock = NSLock()
     var manifestResult: Result<Manifest, Error> = .failure(HttpClientError.transport("не настроено"))
+    // Если непусто — используется вместо `manifestResult`, по одному элементу на
+    // вызов (последний элемент переиспользуется, если вызовов больше, чем элементов).
+    // Нужно тестам повтора при 409: первый вызов манифеста обязан отличаться от
+    // второго (другой seq/содержимое), а не быть одним и тем же значением на все вызовы.
+    var manifestResults: [Result<Manifest, Error>] = []
     var blobResults: [Int: Result<Data?, Error>] = [:]
+    // Если для индекса задана непустая очередь — используется вместо `blobResults[index]`
+    // для ЭТОГО индекса, по одному элементу на вызов данного индекса (аналогично
+    // `manifestResults`) — тот же приём для блобов: первый вызов индекса 0 бросает 409,
+    // второй (после повтора) отдаёт настоящие байты.
+    var blobResultsSequence: [Int: [Result<Data?, Error>]] = [:]
     private(set) var manifestCallCount = 0
     private(set) var blobCallIndexes: [Int] = []
+    private var blobCallCountByIndex: [Int: Int] = [:]
 
     func manifest(host: String, port: Int, token: String) throws -> Manifest {
-        lock.lock(); manifestCallCount += 1; let result = manifestResult; lock.unlock()
+        lock.lock()
+        manifestCallCount += 1
+        let result: Result<Manifest, Error>
+        if !manifestResults.isEmpty {
+            let idx = min(manifestCallCount - 1, manifestResults.count - 1)
+            result = manifestResults[idx]
+        } else {
+            result = manifestResult
+        }
+        lock.unlock()
         return try result.get()
     }
 
     func blob(host: String, port: Int, token: String, index: Int, seq: Int, to file: URL?) throws -> Data? {
         lock.lock()
         blobCallIndexes.append(index)
-        let result = blobResults[index] ?? .failure(HttpClientError.status(404))
+        let result: Result<Data?, Error>
+        if let sequence = blobResultsSequence[index], !sequence.isEmpty {
+            let callNumber = blobCallCountByIndex[index] ?? 0
+            blobCallCountByIndex[index] = callNumber + 1
+            let idx = min(callNumber, sequence.count - 1)
+            result = sequence[idx]
+        } else {
+            result = blobResults[index] ?? .failure(HttpClientError.status(404))
+        }
         lock.unlock()
 
         let data = try result.get()
@@ -214,6 +242,98 @@ final class PullClientTests: XCTestCase {
         }
         XCTAssertTrue(writer.written.isEmpty)
         XCTAssertEqual(writer.content, .empty)
+    }
+
+    // MARK: - Рулинг ревью задачи 26: ровно один автоматический повтор при 409
+
+    func testChangedMidTransferRetriesOnceAndSucceedsWithSecondAttemptContent() throws {
+        // Замер на реальном ПК (задача 26): ~20% pull-ов файлов ловили 409 из-за
+        // фонового шума Windows (seq буфера уезжал между манифестом и блобом) — каждый
+        // пятый Ctrl+Shift+V показывал ошибку вместо результата. Первая попытка здесь
+        // нарочно рвётся на 409, вторая — отдаёт другой манифест (другой seq, другие
+        // байты), чтобы отличить "повторили тот же манифест" от "дёрнули заново,
+        // честно приняли текущее состояние соседа".
+        let config = makeConfig()
+        let fetcher = FakeFetcher()
+        fetcher.manifestResults = [
+            .success(.image(pngSize: 3, seq: 5)),
+            .success(.image(pngSize: 5, seq: 6)),
+        ]
+        fetcher.blobResultsSequence[0] = [
+            .failure(HttpClientError.status(409)),
+            .success(Data([9, 9, 9, 9, 9])),
+        ]
+        let writer = FakeClipboard()
+        let (client, resolver) = makeClient(config: config, prober: FakeProber(), fetcher: fetcher, writer: writer)
+
+        let result = try client.pull()
+
+        XCTAssertEqual(result.kind, .image)
+        XCTAssertEqual(result.bytes, 5, "байты должны быть от второй, успешной попытки, а не от первой сорвавшейся")
+        XCTAssertEqual(writer.written.count, 1, "буфер записан ровно один раз")
+        XCTAssertEqual(writer.content, .image(Data([9, 9, 9, 9, 9])), "содержимое — от успешного повтора")
+        XCTAssertEqual(fetcher.manifestCallCount, 2, "манифест обязан быть перезапрошен заново на повторе")
+
+        // 409 не считается сбоем транспорта ни на первой, ни на второй попытке — кеш
+        // резолвера не должен трогаться.
+        XCTAssertEqual(resolver.resolve(), "10.0.0.2", "кеш резолвера должен пережить повтор")
+    }
+
+    func testChangedMidTransferOnBothAttemptsPropagatesErrorAndLeavesClipboardUntouched() throws {
+        // Ровно ОДИН повтор, не цикл до успеха: если сосед продолжает меняться, второй
+        // 409 подряд обязан долететь до пользователя как обычная ошибка, а не зависнуть
+        // в бесконечном повторе.
+        let config = makeConfig()
+        let fetcher = FakeFetcher()
+        fetcher.manifestResult = .success(.image(pngSize: 3, seq: 5))
+        fetcher.blobResults[0] = .failure(HttpClientError.status(409)) // одинаково на каждый вызов
+        let writer = FakeClipboard()
+        writer.content = .text("прежнее содержимое")
+        let (client, resolver) = makeClient(config: config, prober: FakeProber(), fetcher: fetcher, writer: writer)
+
+        XCTAssertThrowsError(try client.pull()) { error in
+            XCTAssertEqual(error as? PullError, .changedMidTransfer)
+        }
+        XCTAssertTrue(writer.written.isEmpty, "буфер не тронут ни на первой, ни на второй попытке")
+        XCTAssertEqual(writer.content, .text("прежнее содержимое"))
+        XCTAssertEqual(fetcher.manifestCallCount, 2, "манифест запрошен дважды — по разу на попытку, не более")
+
+        XCTAssertEqual(resolver.resolve(), "10.0.0.2",
+                       "409 на обеих попытках всё равно не должен сбрасывать кеш резолвера")
+    }
+
+    func testChangedMidTransferRetryCreatesFreshStagingBatchNotReusingFirst() throws {
+        // Каждая попытка обязана создавать СВОЮ партию стейджинга — `download(manifest:
+        // host:)` вызывает `staging.newBatch()` заново при каждом вызове, поэтому вторая
+        // попытка не должна досыпать файлы в партию первой, сорвавшейся попытки.
+        let config = makeConfig()
+        let fetcher = FakeFetcher()
+        let blobs = [BlobRef(i: 0, rel: "a.txt", size: 5)]
+        fetcher.manifestResults = [
+            .success(.files(blobs, seq: 10)),
+            .success(.files(blobs, seq: 11)),
+        ]
+        fetcher.blobResultsSequence[0] = [
+            .failure(HttpClientError.status(409)),
+            .success(Data("hello".utf8)),
+        ]
+        let writer = FakeClipboard()
+        let (client, _) = makeClient(config: config, prober: FakeProber(), fetcher: fetcher, writer: writer)
+
+        let result = try client.pull()
+
+        XCTAssertEqual(result.kind, .files)
+        guard case .files(let urls)? = writer.written.first else {
+            return XCTFail("ожидали запись .files в буфер")
+        }
+        XCTAssertEqual(urls.count, 1)
+        XCTAssertEqual(try Data(contentsOf: urls[0]), Data("hello".utf8), "содержимое — от успешного повтора")
+
+        // Под stagingRoot должно быть ровно 2 подпапки: одна (почти пустая, без файла)
+        // от первой сорвавшейся попытки, вторая — с настоящим файлом от второй. Если бы
+        // повтор переиспользовал партию первой попытки, подпапка была бы одна.
+        let batches = try FileManager.default.contentsOfDirectory(atPath: stagingRoot.path)
+        XCTAssertEqual(batches.count, 2, "каждая попытка обязана создать свою партию: \(batches)")
     }
 
     // MARK: - Пустой буфер соседа

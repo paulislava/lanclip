@@ -42,17 +42,85 @@ namespace LanClip.Tests
         // все ветки PullClient без поднятия сокета.
         class FakeFetcher : IBlobFetcher
         {
+            // Исход одного вызова Manifest(...) — либо успешный манифест, либо
+            // исключение. Нужен для ManifestSequence: тестам повтора при 409
+            // требуется, чтобы ПЕРВЫЙ вызов манифеста отличался от ВТОРОГО (разный
+            // seq/содержимое), а не один и тот же ManifestResult на каждый вызов.
+            public class ManifestOutcome
+            {
+                public Manifest Manifest;
+                public Exception Exception;
+
+                public static ManifestOutcome Ok(Manifest manifest)
+                {
+                    ManifestOutcome outcome = new ManifestOutcome();
+                    outcome.Manifest = manifest;
+                    return outcome;
+                }
+
+                public static ManifestOutcome Fail(Exception exception)
+                {
+                    ManifestOutcome outcome = new ManifestOutcome();
+                    outcome.Exception = exception;
+                    return outcome;
+                }
+            }
+
+            // То же самое для одного вызова Blob(...) по конкретному индексу — нужно,
+            // чтобы для одного и того же index первый вызов (в первой попытке) бросал
+            // 409, а второй вызов (после повтора) возвращал реальные байты.
+            public class BlobOutcome
+            {
+                public byte[] Data;
+                public Exception Exception;
+
+                public static BlobOutcome Ok(byte[] data)
+                {
+                    BlobOutcome outcome = new BlobOutcome();
+                    outcome.Data = data;
+                    return outcome;
+                }
+
+                public static BlobOutcome Fail(Exception exception)
+                {
+                    BlobOutcome outcome = new BlobOutcome();
+                    outcome.Exception = exception;
+                    return outcome;
+                }
+            }
+
             public Manifest ManifestResult;
             public Exception ManifestException;
             public int ManifestCallCount;
+            // Если задано (не пусто) — используется вместо ManifestResult/
+            // ManifestException, по одному элементу на вызов (последний элемент
+            // переиспользуется, если вызовов больше, чем элементов в очереди).
+            public List<ManifestOutcome> ManifestSequence;
 
             public readonly Dictionary<int, byte[]> BlobResults = new Dictionary<int, byte[]>();
             public readonly Dictionary<int, Exception> BlobExceptions = new Dictionary<int, Exception>();
+            // Если для индекса задана непустая очередь — используется вместо
+            // BlobResults/BlobExceptions для ЭТОГО индекса, по одному элементу на
+            // вызов данного индекса (аналогично ManifestSequence).
+            public readonly Dictionary<int, List<BlobOutcome>> BlobSequenceByIndex = new Dictionary<int, List<BlobOutcome>>();
             public readonly List<int> BlobCallIndexes = new List<int>();
+            readonly Dictionary<int, int> blobCallCountByIndex = new Dictionary<int, int>();
 
             public Manifest Manifest(string host, int port, string token)
             {
                 ManifestCallCount++;
+
+                if (ManifestSequence != null && ManifestSequence.Count > 0)
+                {
+                    int idx = Math.Min(ManifestCallCount - 1, ManifestSequence.Count - 1);
+                    ManifestOutcome outcome = ManifestSequence[idx];
+                    if (outcome.Exception != null)
+                    {
+                        throw outcome.Exception;
+                    }
+                    return outcome.Manifest;
+                }
+
                 if (ManifestException != null)
                 {
                     throw ManifestException;
@@ -63,6 +131,26 @@ namespace LanClip.Tests
             public byte[] Blob(string host, int port, string token, int index, int seq, string toFile)
             {
                 BlobCallIndexes.Add(index);
+
+                List<BlobOutcome> sequence;
+                if (BlobSequenceByIndex.TryGetValue(index, out sequence) && sequence.Count > 0)
+                {
+                    int callNumber;
+                    blobCallCountByIndex.TryGetValue(index, out callNumber);
+                    blobCallCountByIndex[index] = callNumber + 1;
+                    int idx = Math.Min(callNumber, sequence.Count - 1);
+                    BlobOutcome outcome = sequence[idx];
+                    if (outcome.Exception != null)
+                    {
+                        throw outcome.Exception;
+                    }
+                    if (toFile != null)
+                    {
+                        File.WriteAllBytes(toFile, outcome.Data);
+                        return null;
+                    }
+                    return outcome.Data;
+                }
 
                 Exception configuredException;
                 if (BlobExceptions.TryGetValue(index, out configuredException))
@@ -276,6 +364,114 @@ namespace LanClip.Tests
 
                 // 409 — это не сбой транспорта, сосед жив: кеш резолвера не должен сбрасываться.
                 T.Eq("10.0.0.2", resolver.Resolve(), "resolver cache kept after 409");
+            });
+
+            // MARK: - Рулинг ревью задачи 26: ровно один автоматический повтор при 409
+
+            T.Run("changed mid transfer retries once and succeeds with second attempt content", delegate
+            {
+                // Замер на реальном ПК (задача 26): ~20% pull-ов файлов ловили 409 из-за
+                // фонового шума Windows (seq буфера уезжал между манифестом и блобом) —
+                // каждый пятый Ctrl+Shift+V показывал ошибку вместо результата. Первая
+                // попытка здесь нарочно рвётся на 409, вторая — отдаёт другой манифест
+                // (другой seq, другие байты), чтобы отличить "повторили тот же строгий
+                // манифест" от "дёрнули заново, честно приняли текущее состояние соседа".
+                Config config = MakeConfig(Config.DefaultMaxBytes);
+                FakeFetcher fetcher = new FakeFetcher();
+                fetcher.ManifestSequence = new List<FakeFetcher.ManifestOutcome>
+                {
+                    FakeFetcher.ManifestOutcome.Ok(Manifest.OfImage(3, 5)),
+                    FakeFetcher.ManifestOutcome.Ok(Manifest.OfImage(5, 6)),
+                };
+                fetcher.BlobSequenceByIndex[0] = new List<FakeFetcher.BlobOutcome>
+                {
+                    FakeFetcher.BlobOutcome.Fail(HttpClientException.OfStatus(409)),
+                    FakeFetcher.BlobOutcome.Ok(new byte[] { 9, 9, 9, 9, 9 }),
+                };
+                FakeClipboard writer = new FakeClipboard();
+                PeerResolver resolver;
+                PullClient client = MakeClient(config, new FakeProber(true), fetcher, writer, out resolver);
+
+                PullResult result = client.Pull();
+
+                T.Eq("image", result.Kind, "kind");
+                T.Eq(5L, result.Bytes, "bytes from second attempt, not the failed first one");
+                T.Eq(1, writer.Written.Count, "буфер записан ровно один раз");
+                T.True(BytesEqual(new byte[] { 9, 9, 9, 9, 9 }, writer.Content.Png), "content is from the successful retry");
+                T.Eq(2, fetcher.ManifestCallCount, "манифест обязан быть перезапрошен заново на повторе, не переиспользован");
+
+                // 409 не считается сбоем транспорта ни на первой, ни на второй попытке —
+                // сосед в порядке, кеш резолвера не должен трогаться.
+                T.Eq("10.0.0.2", resolver.Resolve(), "resolver cache kept across the retry");
+            });
+
+            T.Run("changed mid transfer on both attempts propagates error and leaves clipboard untouched", delegate
+            {
+                // Ровно ОДИН повтор, не цикл до успеха: если сосед продолжает меняться,
+                // второй 409 подряд обязан долететь до пользователя как обычная ошибка,
+                // а не зависнуть в бесконечном повторе.
+                Config config = MakeConfig(Config.DefaultMaxBytes);
+                FakeFetcher fetcher = new FakeFetcher();
+                fetcher.ManifestResult = Manifest.OfImage(3, 5);
+                fetcher.BlobExceptions[0] = HttpClientException.OfStatus(409); // одинаково на каждый вызов
+                FakeClipboard writer = new FakeClipboard();
+                writer.Content = ClipContent.OfText("прежнее содержимое");
+                PeerResolver resolver;
+                PullClient client = MakeClient(config, new FakeProber(true), fetcher, writer, out resolver);
+
+                PullException caught = ExpectThrows(new Action(delegate { client.Pull(); }));
+                T.Eq(PullException.CodeChanged, caught.Code, "code");
+                T.True(writer.Written.Count == 0, "буфер не тронут ни на первой, ни на второй попытке");
+                T.Eq("прежнее содержимое", writer.Content.Text, "clipboard untouched");
+                T.Eq(2, fetcher.ManifestCallCount, "манифест запрошен дважды — по разу на попытку, не более");
+
+                T.Eq("10.0.0.2", resolver.Resolve(), "409 на обеих попытках всё равно не должен сбрасывать кеш резолвера");
+            });
+
+            T.Run("changed mid transfer retry creates fresh staging batch not reusing first", delegate
+            {
+                // Собственный, изолированный staging root (а не общий stagingRoot этого
+                // файла) — иначе счётчик подпапок отражал бы партии всех остальных
+                // тестов сьюта, а не только этих двух попыток.
+                string root = Path.Combine(Path.GetTempPath(), "lanclip-pullclient-retrybatch-" + Guid.NewGuid());
+                Directory.CreateDirectory(root);
+                try
+                {
+                    Staging staging = new Staging(root, new Func<DateTime>(delegate { return DateTime.UtcNow; }));
+
+                    Config config = MakeConfig(Config.DefaultMaxBytes);
+                    FakeFetcher fetcher = new FakeFetcher();
+                    List<BlobRef> blobs = new List<BlobRef> { Blob(0, "a.txt", 5) };
+                    fetcher.ManifestSequence = new List<FakeFetcher.ManifestOutcome>
+                    {
+                        FakeFetcher.ManifestOutcome.Ok(Files(blobs, 10)),
+                        FakeFetcher.ManifestOutcome.Ok(Files(blobs, 11)),
+                    };
+                    fetcher.BlobSequenceByIndex[0] = new List<FakeFetcher.BlobOutcome>
+                    {
+                        FakeFetcher.BlobOutcome.Fail(HttpClientException.OfStatus(409)),
+                        FakeFetcher.BlobOutcome.Ok(Encoding.UTF8.GetBytes("hello")),
+                    };
+                    FakeClipboard writer = new FakeClipboard();
+                    PeerResolver resolver = new PeerResolver(config, new FakeProber(true));
+                    PullClient client = new PullClient(config, resolver, fetcher, staging, writer);
+
+                    PullResult result = client.Pull();
+
+                    T.Eq("files", result.Kind, "kind");
+                    List<string> paths = writer.Content.Files;
+                    T.Eq(1, paths.Count, "one file");
+                    T.Eq("hello", Encoding.UTF8.GetString(File.ReadAllBytes(paths[0])), "content is from the successful retry");
+
+                    string[] batchDirs = Directory.GetDirectories(root);
+                    T.Eq(2, batchDirs.Length,
+                        "каждая попытка обязана создать свою партию стейджинга, а не досыпать файлы в партию первой: "
+                        + string.Join(", ", batchDirs));
+                }
+                finally
+                {
+                    Directory.Delete(root, true);
+                }
             });
 
             T.Run("status 409 during second file fetch leaves clipboard untouched", delegate
