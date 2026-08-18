@@ -1,9 +1,24 @@
 import Foundation
 import Network
 
+/// Итог одной health-пробы — находка I10 финального ревью: раньше `probe`
+/// возвращал голый `Bool`, поэтому `401` (сосед жив, но отверг токен) и отказ
+/// соединения (сосед выключен/недостижим) сворачивались в одно и то же
+/// «сосед не найден». Опечатка при переносе токена — самая вероятная ошибка
+/// первой настройки, и старое сообщение отправляло пользователя чинить сеть и
+/// файрвол вместо конфига.
+public enum ProbeOutcome: Equatable, Sendable {
+    /// Ответил `200` — сосед жив и токен принят.
+    case alive
+    /// Ответил, но не `200` (в первую очередь `401`) — сосед жив, токен неверный.
+    case rejectedToken
+    /// Не ответил вовсе (таймаут, отказ соединения, недостижимый хост).
+    case unreachable
+}
+
 /// Проверка живости соседа: `GET /health` с ожиданием на `timeout`, без деталей ошибки.
 public protocol HealthProbing: Sendable {
-    func probe(host: String, port: Int, token: String, timeout: TimeInterval) -> Bool
+    func probe(host: String, port: Int, token: String, timeout: TimeInterval) -> ProbeOutcome
 }
 
 /// Загрузка манифеста и блобов буфера соседа.
@@ -62,12 +77,19 @@ public final class NwHttpClient: HealthProbing, BlobFetching, @unchecked Sendabl
 
     // MARK: - HealthProbing
 
-    public func probe(host: String, port: Int, token: String, timeout: TimeInterval) -> Bool {
+    public func probe(host: String, port: Int, token: String, timeout: TimeInterval) -> ProbeOutcome {
         guard let outcome = try? perform(host: host, port: port, token: token, path: "/health",
                                           timeout: timeout, file: nil) else {
-            return false
+            return .unreachable
         }
-        return outcome.status == 200
+        if outcome.status == 200 { return .alive }
+        // `HttpServer.route` отвечает 401 без тела ровно на неверный/отсутствующий
+        // токен — это и есть искомый "сосед жив, но токен неверный". Любой другой
+        // код (403 — не должен случаться для приватного LAN-адреса, 404/405 —
+        // сосед вообще не lanclip) трактуется как unreachable: мы не притворяемся,
+        // что знаем причину точнее, чем "не удалось получить внятный ответ".
+        if outcome.status == 401 { return .rejectedToken }
+        return .unreachable
     }
 
     // MARK: - BlobFetching

@@ -35,12 +35,20 @@ final class HttpClientTests: XCTestCase {
 
     // MARK: - probe()
 
-    func testProbeIsTrueWithCorrectToken() {
-        XCTAssertTrue(client.probe(host: "127.0.0.1", port: port, token: testToken, timeout: 3))
+    func testProbeIsAliveWithCorrectToken() {
+        XCTAssertEqual(client.probe(host: "127.0.0.1", port: port, token: testToken, timeout: 3), .alive)
     }
 
-    func testProbeIsFalseWithWrongToken() {
-        XCTAssertFalse(client.probe(host: "127.0.0.1", port: port, token: "wrong", timeout: 3))
+    /// I10 (находка финального ревью): раньше `401` и отказ соединения одинаково
+    /// сворачивались в `false` — теперь это различимый исход `.rejectedToken`, а
+    /// не то же самое, что "соседа вообще нет на этом порту".
+    func testProbeIsRejectedTokenWithWrongToken() {
+        XCTAssertEqual(client.probe(host: "127.0.0.1", port: port, token: "wrong", timeout: 3), .rejectedToken)
+    }
+
+    func testProbeIsUnreachableWithNoListenerAtAll() {
+        let deadPort = server.boundPort == 65_535 ? 65_534 : server.boundPort + 1
+        XCTAssertEqual(client.probe(host: "127.0.0.1", port: deadPort, token: testToken, timeout: 1), .unreachable)
     }
 
     /// Каждый вызов `perform()` открывает своё `NWConnection` — резидентный агент
@@ -53,7 +61,7 @@ final class HttpClientTests: XCTestCase {
     /// починка (слабый захват + обнуление handler'а) проверяется чтением диффа.
     func testHundredSequentialProbesAllSucceedWithoutLeakingConnections() {
         for _ in 0..<100 {
-            XCTAssertTrue(client.probe(host: "127.0.0.1", port: port, token: testToken, timeout: 3))
+            XCTAssertEqual(client.probe(host: "127.0.0.1", port: port, token: testToken, timeout: 3), .alive)
         }
     }
 

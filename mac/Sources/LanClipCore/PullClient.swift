@@ -6,7 +6,13 @@ import Foundation
 /// сведены сюда, чтобы вызывающая сторона (хоткей, `HttpServer.pull`) могла решить,
 /// что показать пользователю, одним `switch`.
 public enum PullError: Error, Equatable {
-    case noPeer
+    /// `tokenRejected` — находка I10 финального ревью: раньше `noPeer` покрывал и
+    /// "никто не отвечает" (сеть/файрвол), и "сосед ответил 401" (опечатка в
+    /// токене) одним и тем же случаем — самая вероятная ошибка первой настройки
+    /// отправляла пользователя чинить сеть вместо того, чтобы перепроверить
+    /// конфиг. `true`, если хотя бы один адрес из `peers` ответил, но отверг наш
+    /// токен (см. `PeerResolver.lastResolveSawTokenRejection`).
+    case noPeer(tokenRejected: Bool)
     case peerEmpty
     case tooLarge(totalSize: Int, maxBytes: Int)
     case changedMidTransfer
@@ -63,7 +69,7 @@ public final class PullClient {
     /// трогается ни при первой, ни при второй попытке — искать другого соседа незачем.
     public func pull() throws -> PullResult {
         guard let host = resolver.resolve() else {
-            throw PullError.noPeer
+            throw PullError.noPeer(tokenRejected: resolver.lastResolveSawTokenRejection)
         }
 
         do {

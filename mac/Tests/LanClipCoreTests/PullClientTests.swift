@@ -21,10 +21,10 @@ private final class FakeProber: HealthProbing, @unchecked Sendable {
         lock.lock(); alive = value; lock.unlock()
     }
 
-    func probe(host: String, port: Int, token: String, timeout: TimeInterval) -> Bool {
+    func probe(host: String, port: Int, token: String, timeout: TimeInterval) -> ProbeOutcome {
         lock.lock()
         defer { lock.unlock() }
-        return alive
+        return alive ? .alive : .unreachable
     }
 }
 
@@ -363,11 +363,36 @@ final class PullClientTests: XCTestCase {
         let (client, _) = makeClient(config: config, prober: FakeProber(alive: false), fetcher: fetcher, writer: writer)
 
         XCTAssertThrowsError(try client.pull()) { error in
-            XCTAssertEqual(error as? PullError, .noPeer)
+            XCTAssertEqual(error as? PullError, .noPeer(tokenRejected: false))
         }
         XCTAssertEqual(fetcher.manifestCallCount, 0)
         XCTAssertTrue(writer.written.isEmpty)
         XCTAssertEqual(writer.content, .text("прежнее содержимое"))
+    }
+
+    /// I10: когда сосед отвечает, но отвергает токен, `pull()` обязан пробросить
+    /// это наружу через `PullError.noPeer(tokenRejected: true)`, а не сворачивать
+    /// в тот же исход, что и полностью выключенный сосед.
+    func testNoLivePeerWithTokenRejectionReportsItInPullError() throws {
+        // `FakeProber` в этом файле знает только `Bool` (жив/не жив) — для этого
+        // теста нужен третий исход, поэтому резолвер собирается напрямую с
+        // подставным `HealthProbing`, возвращающим `.rejectedToken`.
+        struct RejectingProber: HealthProbing {
+            func probe(host: String, port: Int, token: String, timeout: TimeInterval) -> ProbeOutcome {
+                .rejectedToken
+            }
+        }
+
+        let config = makeConfig()
+        let fetcher = FakeFetcher()
+        let writer = FakeClipboard()
+        let resolver = PeerResolver(config: config, prober: RejectingProber())
+        let client = PullClient(config: config, resolver: resolver, fetcher: fetcher,
+                                 staging: makeStaging(), writer: writer)
+
+        XCTAssertThrowsError(try client.pull()) { error in
+            XCTAssertEqual(error as? PullError, .noPeer(tokenRejected: true))
+        }
     }
 
     // MARK: - Ошибка транспорта инвалидирует кеш резолвера

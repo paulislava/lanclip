@@ -6,11 +6,11 @@ import XCTest
 /// резолверу ходить в сеть повторно, пока не сброшен.
 private final class FakeProber: HealthProbing, @unchecked Sendable {
     private let lock = NSLock()
-    private var alive: [String: Bool]
+    private var outcomes: [String: ProbeOutcome]
     private(set) var callCounts: [String: Int] = [:]
 
     init(alive: [String: Bool]) {
-        self.alive = alive
+        self.outcomes = alive.mapValues { $0 ? .alive : .unreachable }
     }
 
     var totalCalls: Int {
@@ -21,14 +21,22 @@ private final class FakeProber: HealthProbing, @unchecked Sendable {
 
     func setAlive(_ isAlive: Bool, for host: String) {
         lock.lock()
-        alive[host] = isAlive
+        outcomes[host] = isAlive ? .alive : .unreachable
         lock.unlock()
     }
 
-    func probe(host: String, port: Int, token: String, timeout: TimeInterval) -> Bool {
+    /// Находка I10: позволяет тестам смоделировать "сосед жив, но отверг токен" —
+    /// третий исход, который раньше `HealthProbing` не мог выразить вовсе.
+    func setOutcome(_ outcome: ProbeOutcome, for host: String) {
+        lock.lock()
+        outcomes[host] = outcome
+        lock.unlock()
+    }
+
+    func probe(host: String, port: Int, token: String, timeout: TimeInterval) -> ProbeOutcome {
         lock.lock()
         callCounts[host, default: 0] += 1
-        let result = alive[host] ?? false
+        let result = outcomes[host] ?? .unreachable
         lock.unlock()
         return result
     }
@@ -120,5 +128,43 @@ final class PeerResolverTests: XCTestCase {
 
         XCTAssertNil(resolver.resolve())
         XCTAssertEqual(prober.totalCalls, 0)
+    }
+
+    // MARK: - I10: неверный токен неотличим от выключенного соседа
+
+    func testResolveRemembersTokenRejectionWhenNoPeerIsAlive() {
+        let prober = FakeProber(alive: [:])
+        prober.setOutcome(.rejectedToken, for: "10.0.0.1")
+        prober.setOutcome(.unreachable, for: "10.0.0.2")
+        let resolver = PeerResolver(config: makeConfig(peers: ["10.0.0.1", "10.0.0.2"]), prober: prober)
+
+        XCTAssertNil(resolver.resolve())
+        XCTAssertTrue(resolver.lastResolveSawTokenRejection,
+                       "хотя бы один сосед ответил 401 — это обязано отличаться от полностью мёртвой сети")
+    }
+
+    func testResolveDoesNotReportTokenRejectionWhenAllPeersAreUnreachable() {
+        let prober = FakeProber(alive: [:])
+        prober.setOutcome(.unreachable, for: "10.0.0.1")
+        prober.setOutcome(.unreachable, for: "10.0.0.2")
+        let resolver = PeerResolver(config: makeConfig(peers: ["10.0.0.1", "10.0.0.2"]), prober: prober)
+
+        XCTAssertNil(resolver.resolve())
+        XCTAssertFalse(resolver.lastResolveSawTokenRejection,
+                        "ни один сосед не ответил вовсе — это не то же самое, что отвергнутый токен")
+    }
+
+    func testSuccessfulResolveClearsPriorTokenRejectionFlag() {
+        let prober = FakeProber(alive: [:])
+        prober.setOutcome(.rejectedToken, for: "10.0.0.1")
+        let resolver = PeerResolver(config: makeConfig(peers: ["10.0.0.1"]), prober: prober)
+        XCTAssertNil(resolver.resolve())
+        XCTAssertTrue(resolver.lastResolveSawTokenRejection)
+
+        prober.setOutcome(.alive, for: "10.0.0.1")
+        resolver.invalidate()
+        XCTAssertEqual(resolver.resolve(), "10.0.0.1")
+        XCTAssertFalse(resolver.lastResolveSawTokenRejection,
+                        "успешный resolve() обязан сбросить прежний флаг отверженного токена")
     }
 }

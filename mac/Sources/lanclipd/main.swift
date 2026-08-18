@@ -147,7 +147,7 @@ func runStatus(configURL: URL) {
     if let peer = resolver.resolve() {
         print("Сосед: \(peer)")
     } else {
-        print("Сосед не найден")
+        print(peerNotFoundMessage(resolver))
     }
 }
 
@@ -156,7 +156,7 @@ func runGet(configURL: URL) {
     let resolver = PeerResolver(config: config, prober: NwHttpClient())
 
     guard let peer = resolver.resolve() else {
-        print("Сосед не найден")
+        print(peerNotFoundMessage(resolver))
         exit(1)
     }
 
@@ -259,8 +259,8 @@ func describePullFailure(_ error: Error) -> String {
     }
 
     switch pullError {
-    case .noPeer:
-        return "Сосед не найден: никто из адресов в \"peers\" не отвечает."
+    case .noPeer(let tokenRejected):
+        return noPeerMessage(tokenRejected: tokenRejected)
     case .peerEmpty:
         return "Буфер соседа пуст — нечего забирать."
     case .tooLarge(let totalSize, let maxBytes):
@@ -270,6 +270,25 @@ func describePullFailure(_ error: Error) -> String {
     case .transport(let detail):
         return "Ошибка обмена с соседом: \(detail)"
     }
+}
+
+// MARK: - "Сосед не найден" → человекочитаемая строка (находка I10)
+
+/// Единая формулировка для всех трёх мест, где CLI сообщает об отсутствии
+/// соседа (`status`, `get`, `describePullFailure`) — раньше "сосед не найден"
+/// печаталось одинаково и при полностью выключенном соседе, и при неверном
+/// токене (сосед ответил 401), из-за чего опечатка в конфиге выглядела как
+/// сетевая/файрвольная проблема.
+func noPeerMessage(tokenRejected: Bool) -> String {
+    if tokenRejected {
+        return "Сосед ответил, но отверг токен (401). Проверьте, что поле \"token\" в конфиге " +
+               "совпадает на обеих машинах."
+    }
+    return "Сосед не найден: никто из адресов в \"peers\" не отвечает."
+}
+
+func peerNotFoundMessage(_ resolver: PeerResolver) -> String {
+    noPeerMessage(tokenRejected: resolver.lastResolveSawTokenRejection)
 }
 
 // MARK: - Тост про файлы после хоткея
