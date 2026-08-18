@@ -156,6 +156,7 @@ namespace LanClip
             HttpWebResponse response = Perform(host, port, token, "/clip", timeoutMs);
             try
             {
+                RequireContentLength(response);
                 using (Stream stream = response.GetResponseStream())
                 {
                     byte[] body = ReadAll(stream, maxResponseBytes);
@@ -168,6 +169,23 @@ namespace LanClip
             }
         }
 
+        // Мелкая находка финального ревью: сервер продукта всегда шлёт
+        // Content-Length на 200 (см. HttpResponse.head() на Mac и WriteResponse()
+        // здесь) — его отсутствие означает испорченного/нештатного соседа, а не
+        // "читай до конца потока и доверяй". HttpWebResponse.ContentLength == -1,
+        // когда заголовок не пришёл; в отличие от Mac (который раньше молча
+        // трактовал отсутствие как 0 и создавал пустой файл), .NET сам читает
+        // поток до EOF и получил бы реальные байты без этой проверки — то есть
+        // асимметрия была в другую сторону, но обе стороны обязаны отвергать
+        // такой ответ одинаково явно, а не расходиться в терпимости к нему.
+        static void RequireContentLength(HttpWebResponse response)
+        {
+            if (response.ContentLength < 0)
+            {
+                throw HttpClientException.Transport("ответ 200 без корректного Content-Length");
+            }
+        }
+
         public byte[] Blob(string host, int port, string token, int index, int seq, string toFile)
         {
             string path = "/clip/blob/" + index.ToString(CultureInfo.InvariantCulture)
@@ -175,6 +193,7 @@ namespace LanClip
             HttpWebResponse response = Perform(host, port, token, path, timeoutMs);
             try
             {
+                RequireContentLength(response);
                 using (Stream stream = response.GetResponseStream())
                 {
                     // PullClient.DownloadImage/DownloadFiles ловят только

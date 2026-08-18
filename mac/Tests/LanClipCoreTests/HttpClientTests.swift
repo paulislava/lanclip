@@ -251,6 +251,54 @@ final class HttpClientTests: XCTestCase {
         XCTAssertEqual(written.count, chunks.count * chunk.count)
     }
 
+    /// Мелкая находка финального ревью: сервер продукта всегда шлёт `Content-Length`
+    /// на 200 (см. `HttpResponse.head()`) — его отсутствие означает испорченного/
+    /// нештатного соседа, а не "пустое тело". Раньше `receiveHeadThenStream`
+    /// трактовал отсутствие как 0, создавал пустой файл на диске и рапортовал
+    /// успех, тихо роняя любые байты, которые сервер прислал следом.
+    private final class NoContentLengthListener: @unchecked Sendable {
+        private let listener: NWListener
+        private let queue = DispatchQueue(label: "no-content-length-listener-test")
+
+        init(body: String) throws {
+            listener = try NWListener(using: .tcp, on: .any)
+            let ready = DispatchSemaphore(value: 0)
+            listener.newConnectionHandler = { [weak self] connection in
+                guard let self else { return }
+                connection.start(queue: self.queue)
+                connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { _, _, _, _ in
+                    let response = "HTTP/1.1 200 OK\r\n\r\n" + body
+                    connection.send(content: Data(response.utf8), completion: .contentProcessed { _ in })
+                }
+            }
+            listener.stateUpdateHandler = { state in
+                if case .ready = state { ready.signal() }
+            }
+            listener.start(queue: queue)
+            guard ready.wait(timeout: .now() + 5) == .success else {
+                throw HttpServerError.listenerTimedOut
+            }
+        }
+
+        var port: Int { Int(listener.port?.rawValue ?? 0) }
+        func stop() { listener.cancel() }
+    }
+
+    func testBlobToFileWithoutContentLengthHeaderIsRejectedAsTransportError() throws {
+        let listener = try NoContentLengthListener(body: "содержимое без Content-Length")
+        defer { listener.stop() }
+
+        let destination = directory.appendingPathComponent("no-content-length.bin")
+        XCTAssertThrowsError(try client.blob(host: "127.0.0.1", port: listener.port, token: testToken,
+                                              index: 0, seq: 0, to: destination)) { error in
+            guard case .transport = error as? HttpClientError else {
+                return XCTFail("ожидали .transport, получили \(error)")
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path),
+                        "без Content-Length файл не должен создаваться вовсе, тем более пустым")
+    }
+
     func testTimeoutFiresAndCancelsConnectionWithoutCrashing() throws {
         let silent = try SilentListener()
         defer { silent.stop() }

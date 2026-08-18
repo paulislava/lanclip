@@ -372,7 +372,20 @@ public final class NwHttpClient: HealthProbing, BlobFetching, @unchecked Sendabl
                     return
                 }
 
-                let declaredLength = head.headers["content-length"].flatMap(Int.init) ?? 0
+                // Мелкая находка финального ревью: отсутствующий `Content-Length` раньше
+                // молча трактовался как `0` — сервер продукта всегда шлёт этот заголовок
+                // (см. `HttpResponse.head()`), поэтому его отсутствие на `200` означает
+                // либо испорченного/нештатного соседа, либо баг на той стороне, а не
+                // "пустое тело". Прежнее поведение создавало пустой файл на диске и
+                // рапортовало успех, тихо роняя все байты, которые сервер мог прислать
+                // следом, — расхождение с Windows-стороной, которая читает поток до EOF
+                // независимо от заголовка и получает реальные байты.
+                guard let declaredLength = head.headers["content-length"].flatMap(Int.init) else {
+                    if box.trySettle(.failure(.transport("ответ 200 без корректного Content-Length"))) {
+                        semaphore.signal()
+                    }
+                    return
+                }
                 let bodyPrefix = Data(buffer[head.bodyStart...].prefix(declaredLength))
 
                 guard FileManager.default.createFile(atPath: fileURL.path, contents: nil) else {

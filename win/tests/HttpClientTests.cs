@@ -86,6 +86,42 @@ namespace LanClip.Tests
                 }
             });
 
+            // Мелкая находка финального ревью: сервер продукта всегда шлёт
+            // Content-Length на 200 (см. HttpResponse.head() на Mac и
+            // HttpServer.WriteResponse() здесь) — его отсутствие означает
+            // испорченного/нештатного соседа. .NET сам читает поток до EOF и
+            // получил бы реальные байты без явной проверки — то есть, в отличие
+            // от Mac (который раньше молча создавал пустой файл), здесь асимметрия
+            // была в другую сторону: слишком терпимо. Обе стороны обязаны
+            // отвергать такой ответ одинаково явно.
+            T.Run("response without Content-Length header is rejected as transport error", delegate
+            {
+                const string text = "{\"kind\":\"empty\",\"seq\":1}";
+                RawResponder noContentLength = new RawResponder(new Func<string, string>(delegate(string request)
+                {
+                    // Соединение закрывается сразу после тела — единственный способ
+                    // обозначить конец сообщения без Content-Length и без chunked.
+                    return "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + text;
+                }));
+                try
+                {
+                    WebBlobFetcher fetcher = new WebBlobFetcher(2000);
+                    try
+                    {
+                        fetcher.Manifest("127.0.0.1", noContentLength.Port, TestToken);
+                        T.True(false, "expected HttpClientException for a missing Content-Length");
+                    }
+                    catch (HttpClientException e)
+                    {
+                        T.Eq(HttpClientException.CodeTransport, e.Code, "code");
+                    }
+                }
+                finally
+                {
+                    noContentLength.Stop();
+                }
+            });
+
             T.Run("response body within the configured cap is accepted normally", delegate
             {
                 const string text = "{\"kind\":\"text\",\"seq\":1,\"text\":\"ok\"}";
