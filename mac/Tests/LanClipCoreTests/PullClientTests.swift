@@ -479,6 +479,88 @@ final class PullClientTests: XCTestCase {
         XCTAssertTrue(writer.written.isEmpty)
     }
 
+    // MARK: - Ревью раунда 3: переполнение суммы по blobs не должно ронять процесс
+
+    func testTwoBlobsAtIntMaxDoNotCrashAndAreTreatedAsCorruptedTransport() throws {
+        // До починки задачи 11 сумма `blob.size` считалась наивным `+`, который в Swift
+        // при переполнении не заворачивается, а падает фатальной ошибкой — и это
+        // падение достижимо ОДНИМ манифестом, ещё до единого HTTP-запроса за блобом
+        // (тот же класс дефекта, что `Content-Length: -1` в парсере задачи 6). Тест
+        // фиксирует, что теперь переполнение ловится как испорченный манифест, а не
+        // роняет процесс.
+        let raw = Data("""
+        {"kind":"files","seq":1,"blobs":[
+            {"i":0,"rel":"a.bin","size":9223372036854775807,"mime":null},
+            {"i":1,"rel":"b.bin","size":9223372036854775807,"mime":null}
+        ]}
+        """.utf8)
+        let manifest = try Manifest.decode(raw)
+
+        let config = makeConfig()
+        let fetcher = FakeFetcher()
+        fetcher.manifestResult = .success(manifest)
+        let writer = FakeClipboard()
+        let prober = FakeProber(alive: true)
+        let (client, resolver) = makeClient(config: config, prober: prober, fetcher: fetcher, writer: writer)
+
+        XCTAssertEqual(resolver.resolve(), "10.0.0.2")
+
+        XCTAssertThrowsError(try client.pull()) { error in
+            guard case .transport = error as? PullError else {
+                return XCTFail("ожидали .transport, получили \(error)")
+            }
+        }
+        XCTAssertTrue(writer.written.isEmpty)
+        XCTAssertEqual(fetcher.blobCallIndexes, [], "переполнение обязано отсекаться до единого запроса за блобом")
+
+        prober.setAlive(false)
+        XCTAssertNil(resolver.resolve(), "переполнение суммы обязано сбрасывать кеш резолвера")
+    }
+
+    func testBlobWithNegativeSizeIsTreatedAsCorruptedTransport() throws {
+        // Отрицательный size не роняет процесс, но незаметно занижает сумму и обходит
+        // лимит maxBytes — отклоняем его так же, как переполнение.
+        let raw = Data(#"{"kind":"files","seq":1,"blobs":[{"i":0,"rel":"a.bin","size":-1,"mime":null}]}"#.utf8)
+        let manifest = try Manifest.decode(raw)
+
+        let config = makeConfig()
+        let fetcher = FakeFetcher()
+        fetcher.manifestResult = .success(manifest)
+        let writer = FakeClipboard()
+        let (client, _) = makeClient(config: config, prober: FakeProber(), fetcher: fetcher, writer: writer)
+
+        XCTAssertThrowsError(try client.pull()) { error in
+            guard case .transport = error as? PullError else {
+                return XCTFail("ожидали .transport, получили \(error)")
+            }
+        }
+        XCTAssertTrue(writer.written.isEmpty)
+        XCTAssertEqual(fetcher.blobCallIndexes, [], "отрицательный size обязан отсекаться до запроса за блобом")
+    }
+
+    // MARK: - Ревью раунда 3: лимит maxBytes действует и на текст
+
+    func testTextLongerThanMaxBytesThrowsTooLargeAndLeavesClipboardUntouched() throws {
+        // Текст, в отличие от файлов, целиком приезжает в теле манифеста и уже лежит в
+        // памяти к моменту проверки — тот же лимит maxBytes обязан его гейтить, а не
+        // пропускать безусловно.
+        let text = "это заведомо длинный текст для проверки лимита maxBytes"
+        XCTAssertGreaterThan(text.utf8.count, 20)
+
+        let config = makeConfig(maxBytes: 20)
+        let fetcher = FakeFetcher()
+        fetcher.manifestResult = .success(.text(text, seq: 1))
+        let writer = FakeClipboard()
+        writer.content = .text("прежнее содержимое")
+        let (client, _) = makeClient(config: config, prober: FakeProber(), fetcher: fetcher, writer: writer)
+
+        XCTAssertThrowsError(try client.pull()) { error in
+            XCTAssertEqual(error as? PullError, .tooLarge(totalSize: text.utf8.count, maxBytes: 20))
+        }
+        XCTAssertTrue(writer.written.isEmpty)
+        XCTAssertEqual(writer.content, .text("прежнее содержимое"))
+    }
+
     // MARK: - Ревью раунда 2: отказ уборки не должен превращать успех в ошибку
 
     func testSuccessfulPullSucceedsEvenWhenStagingCleanupFails() throws {

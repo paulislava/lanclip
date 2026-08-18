@@ -93,22 +93,47 @@ public final class PullClient {
     }
 
     /// Проверяет межполевые инварианты, которые `Manifest.decode` не проверяет сам, и
-    /// возвращает настоящий `totalSize` — сумму по `blobs`, посчитанную нами, а не
-    /// присланное соседом число (иначе сосед мог бы объявить `totalSize: 1` и приложить
-    /// блобы суммарно на гигабайты — лимит `maxBytes` тогда не работал бы вовсе).
+    /// возвращает настоящий размер содержимого, который должен гейтиться `maxBytes` —
+    /// для `.text` это длина текста в UTF-8, для `.image`/`.files` — сумма по `blobs`,
+    /// посчитанная нами, а не присланное соседом число (иначе сосед мог бы объявить
+    /// `totalSize: 1` и приложить блобы суммарно на гигабайты — лимит `maxBytes` тогда
+    /// не работал бы вовсе).
     private func validateManifestIntegrity(_ manifest: Manifest) throws -> Int {
         switch manifest.kind {
         case .text:
-            guard manifest.text != nil else {
+            guard let text = manifest.text else {
                 throw corruptedManifestError("kind=text без text")
             }
-            return 0
+            // Текст, в отличие от файлов, целиком приезжает в теле манифеста и уже
+            // лежит в памяти к этому моменту — тот же лимит maxBytes обязан его
+            // гейтить на общих основаниях, а не считать текст бесплатным.
+            return text.utf8.count
 
         case .image, .files:
             guard let blobs = manifest.blobs, !blobs.isEmpty else {
                 throw corruptedManifestError("kind=\(manifest.kind.rawValue) без blobs")
             }
-            let computedTotal = blobs.reduce(0) { $0 + $1.size }
+
+            // `BlobRef.size` — обычное число с провода, ничем не ограниченное:
+            // складывать его наивным `+` нельзя — Swift не заворачивает переполнение,
+            // а падает фатальной ошибкой, и это падение достижимо ОДНИМ манифестом,
+            // ещё до единого HTTP-запроса за блобом (см. ревью — тот же класс дефекта,
+            // что `Content-Length: -1` в парсере задачи 6). Копим сумму вручную с
+            // контролем переполнения; отрицательный размер отдельного блоба тоже
+            // отклоняем — он не роняет процесс, но незаметно занижает сумму и обходит
+            // лимит `maxBytes`.
+            var computedTotal = 0
+            for blob in blobs {
+                guard blob.size >= 0 else {
+                    throw corruptedManifestError("blob \(blob.rel) с отрицательным size=\(blob.size)")
+                }
+                let (sum, overflow) = computedTotal.addingReportingOverflow(blob.size)
+                guard !overflow else {
+                    throw corruptedManifestError("сумма размеров blobs переполняет Int")
+                }
+                computedTotal = sum
+            }
+
             if let declaredTotal = manifest.totalSize, declaredTotal != computedTotal {
                 throw corruptedManifestError(
                     "totalSize=\(declaredTotal) в манифесте расходится с суммой по blobs=\(computedTotal)")
