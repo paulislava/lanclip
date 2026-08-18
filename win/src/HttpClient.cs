@@ -76,11 +76,32 @@ namespace LanClip
     {
         const int ReadBufferSize = 65536;
 
+        // Находка I5 финального ревью: ReadAll/StreamToFile копили тело ответа без
+        // всякого потолка, игнорируя Content-Length — сосед, знающий токен (или
+        // MITM на той же подсети), мог заставить Windows-агента съесть память
+        // (ReadAll -> манифест/картинка в памяти) или залить диск (StreamToFile ->
+        // файлы) произвольным объёмом данных. Mac-сторона ограничивает приём в
+        // память тем же числом (`NwHttpClient.maxInMemoryResponseBytes` в
+        // mac/Sources/LanClipCore/HttpClient.swift, привязано к
+        // Config.defaultMaxBytes) — здесь используется тот же источник константы,
+        // а не отдельно придуманное число, чтобы оба клиента были согласованы.
+        const long DefaultMaxResponseBytes = Config.DefaultMaxBytes;
+
         readonly int timeoutMs;
+        readonly long maxResponseBytes;
 
         public WebBlobFetcher(int timeoutMs)
+            : this(timeoutMs, DefaultMaxResponseBytes)
+        {
+        }
+
+        // Перегрузка с явным потолком — используется тестами, которым не нужно
+        // (и физически не под силу за разумное время) гонять реальные полгигабайта
+        // по loopback, чтобы проверить сам механизм отказа при превышении.
+        public WebBlobFetcher(int timeoutMs, long maxResponseBytes)
         {
             this.timeoutMs = timeoutMs;
+            this.maxResponseBytes = maxResponseBytes;
         }
 
         // MARK: - IHealthProber
@@ -114,7 +135,7 @@ namespace LanClip
             {
                 using (Stream stream = response.GetResponseStream())
                 {
-                    byte[] body = ReadAll(stream);
+                    byte[] body = ReadAll(stream, maxResponseBytes);
                     return LanClip.Manifest.FromJson(Encoding.UTF8.GetString(body));
                 }
             }
@@ -144,10 +165,10 @@ namespace LanClip
                     {
                         if (toFile != null)
                         {
-                            StreamToFile(stream, toFile);
+                            StreamToFile(stream, toFile, maxResponseBytes);
                             return null;
                         }
-                        return ReadAll(stream);
+                        return ReadAll(stream, maxResponseBytes);
                     }
                     catch (HttpClientException)
                     {
@@ -190,10 +211,31 @@ namespace LanClip
             request.Headers["X-Clip-Token"] = token;
             request.Timeout = requestTimeoutMs;
             request.KeepAlive = false;
+            // Находка I5 финального ревью: HttpWebRequest по умолчанию следует
+            // редиректам, и в .NET Framework при этом переносит кастомные
+            // заголовки (включая X-Clip-Token) на хост, указанный в Location —
+            // сосед на той же подсети (или MITM), знающий токен, мог ответить 302
+            // на произвольный адрес и получить токен на чужой хост. Swift-сторона
+            // редиректов не разбирает вовсе (сама читает HTTP руками через
+            // NWConnection), поэтому единственный способ уравнять поведение —
+            // выключить автоследование здесь явно, а не полагаться на дефолт.
+            request.AllowAutoRedirect = false;
 
             try
             {
-                return (HttpWebResponse)request.GetResponse();
+                HttpWebResponse response = (HttpWebResponse)request.GetResponse();
+                // С AllowAutoRedirect=false ответы 300-399 ("Location" на произвольный
+                // хост от недоверенного соседа) возвращаются сюда НОРМАЛЬНО, без
+                // WebException — контракт этого метода ("либо 200, либо
+                // HttpClientException") обязан остаться в силе и для них, иначе
+                // вызывающая сторона получила бы 3xx-ответ, которого не ожидает.
+                if ((int)response.StatusCode != 200)
+                {
+                    int status = (int)response.StatusCode;
+                    response.Close();
+                    throw HttpClientException.OfStatus(status);
+                }
+                return response;
             }
             catch (WebException e)
             {
@@ -214,27 +256,59 @@ namespace LanClip
             }
         }
 
-        static void StreamToFile(Stream input, string path)
+        // Content-Length сознательно не используется как единственная защита: заголовку
+        // недоверенного соседа нельзя доверять (он может занизить его и прислать больше
+        // по факту, либо не прислать вовсе при chunked-передаче), поэтому предел считается
+        // по фактически прочитанным байтам, а не по заявленному значению.
+        static void StreamToFile(Stream input, string path, long maxBytes)
         {
+            bool overflowed = false;
             using (FileStream output = new FileStream(path, FileMode.Create, FileAccess.Write))
             {
                 byte[] buffer = new byte[ReadBufferSize];
+                long total = 0;
                 int read;
                 while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
                 {
+                    total += read;
+                    if (total > maxBytes)
+                    {
+                        overflowed = true;
+                        break;
+                    }
                     output.Write(buffer, 0, read);
                 }
             }
+
+            if (overflowed)
+            {
+                try
+                {
+                    File.Delete(path);
+                }
+                catch (Exception)
+                {
+                    // Не удалось убрать частично записанный файл — не критично, отказ
+                    // транспорта важнее и летит наружу в любом случае.
+                }
+                throw HttpClientException.Transport("тело ответа превысило предел " + maxBytes + " байт");
+            }
         }
 
-        static byte[] ReadAll(Stream input)
+        static byte[] ReadAll(Stream input, long maxBytes)
         {
             using (MemoryStream buffer = new MemoryStream())
             {
                 byte[] chunk = new byte[ReadBufferSize];
+                long total = 0;
                 int read;
                 while ((read = input.Read(chunk, 0, chunk.Length)) > 0)
                 {
+                    total += read;
+                    if (total > maxBytes)
+                    {
+                        throw HttpClientException.Transport("тело ответа превысило предел " + maxBytes + " байт");
+                    }
                     buffer.Write(chunk, 0, read);
                 }
                 return buffer.ToArray();
