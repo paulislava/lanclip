@@ -57,8 +57,10 @@ namespace LanClip
             return names;
         }
 
-        // Семь правил в строго этом порядке (см. mac/Sources/LanClipCore/RelPath.swift —
+        // Восемь правил в строго этом порядке (см. mac/Sources/LanClipCore/RelPath.swift —
         // эталон, с которым эта реализация обязана совпадать бит в бит):
+        // 0. нормализация Unicode к NFC (String.Normalize(FormC)) — до всего
+        //    остального, включая подсчёт длины в байтах
         // 1. \ -> /
         // 2. разбить и выбросить пустые компоненты и "."
         // 3. любой компонент ".." -> отказ
@@ -74,7 +76,27 @@ namespace LanClip
         //    4 байта UTF-8).
         public static string Normalize(string raw)
         {
-            string unified = raw.Replace("\\", "/");
+            // NFC до всего остального: macOS отдаёт имена файлов из файловой
+            // системы в разложенной форме (NFD, например "ё" = "е" + U+0308
+            // комбинирующий диакритик), Windows ничего не нормализует сам —
+            // без явного приведения файл с одинаковым на вид именем приезжает
+            // как ДРУГАЯ строка побайтово (см. mac/Sources/LanClipCore/RelPath.swift).
+            // Нормализация обязана идти до подсчёта длины в байтах UTF-8 ниже:
+            // предел должен считаться от той формы, в которой путь окажется на
+            // диске, а не от формы, в которой он прибыл.
+            // String.Normalize бросает ArgumentException на строке с
+            // недопустимыми суррогатами — это отказ нормализации (как ".." или
+            // пустой результат), а не необработанное исключение наружу.
+            string precomposed;
+            try
+            {
+                precomposed = raw.Normalize(NormalizationForm.FormC);
+            }
+            catch (ArgumentException)
+            {
+                return null;
+            }
+            string unified = precomposed.Replace("\\", "/");
             string[] pieces = unified.Split(new char[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
             List<string> components = new List<string>();
 

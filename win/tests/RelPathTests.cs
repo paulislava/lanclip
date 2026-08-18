@@ -167,6 +167,53 @@ namespace LanClip.Tests
                 string onceAcceptedNowRejected = segment + "/" + segment;
                 T.Eq(null, RelPath.Normalize(onceAcceptedNowRejected), "201-byte multi-component path");
             });
+
+            // MARK: - Живой дефект: имя с "ё" приезжает разложенным (NFD) с macOS
+
+            // "отчёт.txt" в разложенной форме (NFD): "о","т","ч","е" + U+0308
+            // (комбинирующий диакритик) + "т",".txt" — именно так macOS отдаёт
+            // имена файлов из файловой системы. Ожидаемый результат —
+            // предсоставленная форма (NFC) с "ё" = U+0451 одним кодпоинтом.
+            // Сравниваем через T.Eq строковое равенство, которое для символов
+            // из базовой плоскости (BMP, как здесь) эквивалентно сравнению
+            // кодовых точек по code unit-ам UTF-16 — визуально "отчёт.txt" и
+            // разложенная форма неотличимы, поэтому дополнительно проверяем
+            // Length (число кодпоинтов), чтобы тест не мог пройти на
+            // случайном совпадении отображения.
+            T.Run("decomposed cyrillic yo is recomposed to NFC", delegate
+            {
+                string nfd = "отчёт.txt";
+                string expectedNfc = "отчёт.txt";
+                string result = RelPath.Normalize(nfd);
+                T.Eq(expectedNfc, result, "NFD -> NFC recomposition");
+                T.Eq(9, result == null ? -1 : result.Length, "NFC result has 9 code points");
+            });
+
+            T.Run("already precomposed cyrillic yo is unchanged", delegate
+            {
+                string nfc = "отчёт.txt";
+                T.Eq(nfc, RelPath.Normalize(nfc), "NFC input stays NFC");
+            });
+
+            // Предел длины считается от нормализованной (NFC) формы: имя в NFD
+            // весит больше MaxTotal байт UTF-8 (комбинирующие диакритики
+            // добавляют байты на каждую букву), а после схлопывания в NFC
+            // укладывается в предел. Без нормализации до подсчёта длины это
+            // имя было бы неправомерно отвергнуто.
+            T.Run("MaxTotal is measured after NFC normalization", delegate
+            {
+                // "ё" в NFD = "е" (2 байта UTF-8) + U+0308 (2 байта) = 4 байта
+                // на букву. В NFC "ё" = U+0451 = 2 байта. 40 повторов: NFD =
+                // 160 байт (> 150, отвергалось бы без нормализации), NFC = 80
+                // байт (укладывается).
+                string nfdYo = "ё";
+                string nfdName = Repeat(nfdYo, 40);
+                T.True(Encoding.UTF8.GetByteCount(nfdName) > RelPath.MaxTotal, "NFD name exceeds MaxTotal in bytes before normalization");
+
+                string result = RelPath.Normalize(nfdName);
+                string expectedNfc = Repeat("ё", 40);
+                T.Eq(expectedNfc, result, "NFD name accepted and recomposed to NFC");
+            });
         }
 
         static string Repeat(string value, int count)

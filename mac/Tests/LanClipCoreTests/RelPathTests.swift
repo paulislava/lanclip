@@ -136,4 +136,53 @@ final class RelPathTests: XCTestCase {
         let onceAcceptedNowRejected = "\(segment)/\(segment)"
         XCTAssertNil(RelPath.normalize(onceAcceptedNowRejected))
     }
+
+    // MARK: - Живой дефект: имя с "ё" приезжает разложенным (NFD) с macOS
+
+    /// "отчёт.txt" в разложенной форме (NFD): "о", "т", "ч", "е" + U+0308
+    /// (комбинирующий диакритик) + "т", ".txt" — именно так macOS отдаёт
+    /// имена файлов из файловой системы. Ожидаемый результат — предсоставленная
+    /// форма (NFC) с "ё" = U+0451 одним кодпоинтом. Сравниваем именно
+    /// unicodeScalars, а не строки: визуально "отчёт.txt" и разложенная форма
+    /// неотличимы, и сравнение строк прошло бы даже без починки.
+    func testDecomposedCyrillicYoIsRecomposedToNFC() {
+        let nfd = "\u{043E}\u{0442}\u{0447}\u{0435}\u{0308}\u{0442}.txt"
+        let expectedNFC = "\u{043E}\u{0442}\u{0447}\u{0451}\u{0442}.txt"
+        guard let result = RelPath.normalize(nfd) else {
+            XCTFail("normalize(nfd) вернул nil")
+            return
+        }
+        XCTAssertEqual(Array(result.unicodeScalars), Array(expectedNFC.unicodeScalars))
+        // Девять кодпоинтов у NFC-версии против десяти у NFD-входа.
+        XCTAssertEqual(result.unicodeScalars.count, 9)
+    }
+
+    /// Уже предсоставленное имя не должно измениться.
+    func testAlreadyPrecomposedCyrillicYoIsUnchanged() {
+        let nfc = "\u{043E}\u{0442}\u{0447}\u{0451}\u{0442}.txt"
+        XCTAssertEqual(RelPath.normalize(nfc).map { Array($0.unicodeScalars) },
+                        Array(nfc.unicodeScalars))
+    }
+
+    /// Предел длины считается от нормализованной (NFC) формы: подобранное имя
+    /// в NFD весит больше 150 байт UTF-8 (комбинирующие диакритики добавляют
+    /// байты на каждую букву), а после схлопывания в NFC укладывается в предел.
+    /// Без нормализации до подсчёта длины это имя было бы неправомерно
+    /// отвергнуто.
+    func testMaxTotalIsMeasuredAfterNFCNormalization() {
+        // "ё" в NFD = "е" (2 байта UTF-8) + U+0308 (2 байта) = 4 байта на букву.
+        // В NFC "ё" = U+0451 = 2 байта. 40 повторов: NFD = 160 байт (> 150,
+        // отвергалось бы без нормализации), NFC = 80 байт (укладывается).
+        let nfdYo = "\u{0435}\u{0308}"
+        let nfdName = String(repeating: nfdYo, count: 40)
+        XCTAssertGreaterThan(nfdName.utf8.count, RelPath.maxTotal)
+
+        guard let result = RelPath.normalize(nfdName) else {
+            XCTFail("normalize должен принять NFD-имя, укладывающееся в предел после NFC")
+            return
+        }
+        XCTAssertLessThanOrEqual(result.utf8.count, RelPath.maxTotal)
+        let expectedNFC = String(repeating: "\u{0451}", count: 40)
+        XCTAssertEqual(Array(result.unicodeScalars), Array(expectedNFC.unicodeScalars))
+    }
 }

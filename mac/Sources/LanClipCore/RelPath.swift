@@ -26,7 +26,16 @@ public enum RelPath {
     }()
 
     public static func normalize(_ raw: String) -> String? {
-        let unified = raw.replacingOccurrences(of: "\\", with: "/")
+        // NFC до всего остального: macOS отдаёт имена файлов из файловой
+        // системы в разложенной форме (NFD, например "ё" = "е" + U+0308
+        // комбинирующий диакритик), а Windows/Linux/веб ожидают
+        // предсоставленную форму (NFC, "ё" = U+0451) — без этого файл с
+        // одинаковым на вид именем приезжает как ДРУГАЯ строка побайтово.
+        // Нормализация обязана идти до подсчёта длины в байтах UTF-8 ниже:
+        // предел должен считаться от той формы, в которой путь окажется на
+        // диске, а не от формы, в которой он прибыл.
+        let precomposed = raw.precomposedStringWithCanonicalMapping
+        let unified = precomposed.replacingOccurrences(of: "\\", with: "/")
         var components: [String] = []
 
         for piece in unified.split(separator: "/", omittingEmptySubsequences: true) {
