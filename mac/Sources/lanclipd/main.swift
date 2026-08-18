@@ -73,7 +73,41 @@ func runServe(configURL: URL) {
         exit(1)
     }
 
-    print("lanclip слушает порт \(server.boundPort) (хост \(hostName))")
+    // Ctrl+Shift+V: `pull()` уходит в сеть и может занять секунды, поэтому выполняется
+    // на фоновой очереди — обработчик хоткея приходит на главную очередь, и её
+    // блокировка сетевым вызовом система сочтёт зависшим процессом. Синтез нажатия,
+    // наоборот, обязан идти на главной очереди и только после того, как pull() уже
+    // вернулся и буфер наполнен.
+    let hotkey = MacHotkey {
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let result = try pullClient.pull()
+
+                if config.autoPaste {
+                    DispatchQueue.main.async {
+                        synthesizePaste()
+                    }
+                }
+
+                // Успех тихий — кроме файлов, где полезно знать, что именно приехало
+                // и сколько весит, до того как открывать Finder.
+                if result.kind == .files {
+                    notifier.info("\(pluralizedFiles(result.fileCount)), \(megabytesString(result.bytes))")
+                }
+            } catch {
+                notifier.error(describePullFailure(error))
+            }
+        }
+    }
+
+    do {
+        try hotkey.register()
+    } catch {
+        printErr("Не удалось зарегистрировать глобальный хоткей Ctrl+Shift+V: \(describe(error))")
+        exit(1)
+    }
+
+    print("lanclip слушает порт \(server.boundPort) (хост \(hostName)), хоткей Ctrl+Shift+V активен")
     RunLoop.current.run()
 }
 
@@ -201,6 +235,38 @@ func describePullFailure(_ error: Error) -> String {
     case .transport(let detail):
         return "Ошибка обмена с соседом: \(detail)"
     }
+}
+
+// MARK: - Тост про файлы после хоткея
+
+/// Русское склонение «файл/файла/файлов» по числу — используется только в тосте
+/// после хоткея (`Config.autoPaste` и pull файлов), больше нигде в проекте текст
+/// не согласуется с числом.
+func pluralizedFiles(_ count: Int) -> String {
+    let mod100 = count % 100
+    let mod10 = count % 10
+
+    let word: String
+    if (11...14).contains(mod100) {
+        word = "файлов"
+    } else if mod10 == 1 {
+        word = "файл"
+    } else if (2...4).contains(mod10) {
+        word = "файла"
+    } else {
+        word = "файлов"
+    }
+
+    return "\(count) \(word)"
+}
+
+/// Округлённый размер в мегабайтах (десятичных, ×1_000_000 — как подписи размера
+/// файлов в Finder). Ненулевой размер, округлившийся к 0 МБ, показывается как 1 МБ —
+/// иначе тост про реально скачанные файлы выглядел бы как «0 МБ», что похоже на баг.
+func megabytesString(_ bytes: Int) -> String {
+    guard bytes > 0 else { return "0 МБ" }
+    let megabytes = max(1, Int((Double(bytes) / 1_000_000).rounded()))
+    return "\(megabytes) МБ"
 }
 
 // MARK: - Мелкие утилиты вывода
