@@ -18,6 +18,7 @@ namespace LanClip.Tests
         static int Main()
         {
             VersionTests.Register();
+            HotkeyLifetimeTests.Register();
             CliArgsTests.Register();
             RelPathTests.Register();
             ManifestTests.Register();
