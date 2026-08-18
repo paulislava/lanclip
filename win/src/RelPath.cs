@@ -8,7 +8,22 @@ namespace LanClip
     static class RelPath
     {
         const int MaxComponent = 150;
-        const int MaxTotal = 400;
+        // internal (не private): значение читает win/tests/RelPathTests.cs, чтобы
+        // проверить бюджет "корень партии + MaxTotal <= легаси MAX_PATH" одним
+        // числом, а не задваивать константу в тестовом файле, которая рискует
+        // разъехаться с реальной при следующей правке.
+        // Находка I8 финального ревью: было 400, что не влезает в легаси
+        // MAX_PATH (260 символов, включая диск и завершающий NUL) вместе со
+        // стейджинг-корнем (%LOCALAPPDATA%\lanclip\incoming\<метка>\, на
+        // реальной машине ~66 символов, плюс запас на более длинное имя
+        // пользователя). rel длиной 195-400 нормализацию проходил, но на
+        // приёме падал необёрнутым PathTooLongException. Выбор 150 (тот же
+        // предел, что и MaxComponent, а не отдельно придуманное число) с
+        // запасом в ~100 символов на корень партии укладывается в 260 с
+        // большим запасом. Предел обязан совпадать на Mac и Windows побитово —
+        // это часть протокола (см. mac/Sources/LanClipCore/RelPath.swift), а
+        // не деталь реализации одной стороны.
+        internal const int MaxTotal = 150;
 
         static readonly HashSet<char> Illegal = BuildIllegal();
         static readonly HashSet<string> Reserved = BuildReserved();

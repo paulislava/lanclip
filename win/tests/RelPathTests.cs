@@ -118,6 +118,36 @@ namespace LanClip.Tests
                 string component = Repeat("а", 80);
                 T.Eq(null, RelPath.Normalize(component), "cyrillic component over byte limit");
             });
+
+            // MARK: - I8: предел обязан реально влезать в MAX_PATH вместе с корнем партии
+
+            // Регрессия находки I8: MaxTotal раньше был 400 — rel такой длины
+            // нормализацию проходил, но на приёме падал необёрнутым
+            // PathTooLongException, потому что root + "\" + rel превышал легаси
+            // MAX_PATH (260 символов). 100 символов — задокументированный в самом
+            // предельном значении запас на корень партии (реально измеренный
+            // корень на машине Павла — около 66 символов); тест провалится, если
+            // кто-то снова поднимет MaxTotal, не пересчитав этот бюджет.
+            T.Run("MaxTotal leaves room for legacy MAX_PATH under the staging root", delegate
+            {
+                const int legacyWindowsMaxPath = 260;
+                const int assumedStagingRootBudget = 100;
+                const int pathSeparator = 1;
+                T.True(assumedStagingRootBudget + pathSeparator + RelPath.MaxTotal <= legacyWindowsMaxPath,
+                    "MaxTotal + assumed root budget must fit under legacy MAX_PATH");
+            });
+
+            // Ровно тот сценарий, который раньше проходил нормализацию, но падал на
+            // приёме: два компонента по 100 байт (каждый сам по себе меньше
+            // MaxComponent=150, поэтому по-компонентной проверке никогда не был бы
+            // отвергнут), но суммарно 201 байт — между старым пределом 400
+            // (проходил) и новым 150 (обязан отвергаться).
+            T.Run("rejects multi-component path that used to pass normalization but overflowed MAX_PATH", delegate
+            {
+                string segment = new string('a', 100);
+                string onceAcceptedNowRejected = segment + "/" + segment;
+                T.Eq(null, RelPath.Normalize(onceAcceptedNowRejected), "201-byte multi-component path");
+            });
         }
 
         static string Repeat(string value, int count)

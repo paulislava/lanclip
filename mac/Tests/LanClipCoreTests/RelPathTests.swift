@@ -91,4 +91,31 @@ final class RelPathTests: XCTestCase {
         let component = String(repeating: "а", count: 80)
         XCTAssertNil(RelPath.normalize(component))
     }
+
+    // MARK: - I8: предел обязан реально влезать в MAX_PATH вместе с корнем партии
+
+    /// Регрессия находки I8: `maxTotal` раньше был 400 — `rel` такой длины
+    /// нормализацию проходил, но на Windows-приёме падал необёрнутым
+    /// `PathTooLongException`, потому что `root + "\\" + rel` превышал легаси
+    /// `MAX_PATH` (260 символов). 100 символов — задокументированный в самом
+    /// предельном значении запас на корень партии (реально измеренный корень
+    /// на машине Павла — около 66 символов); тест провален бы, если кто-то
+    /// снова поднимет `maxTotal`, не пересчитав этот бюджет.
+    func testMaxTotalLeavesRoomForWindowsLegacyMaxPathUnderStagingRoot() {
+        let legacyWindowsMaxPath = 260
+        let assumedStagingRootBudget = 100
+        let pathSeparator = 1
+        XCTAssertLessThanOrEqual(assumedStagingRootBudget + pathSeparator + RelPath.maxTotal, legacyWindowsMaxPath)
+    }
+
+    /// Ровно тот сценарий, который раньше проходил нормализацию, но падал на
+    /// приёме: два компонента по 100 байт (каждый сам по себе меньше
+    /// `maxComponent`=150, поэтому по-компонентной проверке никогда не был бы
+    /// отвергнут), но суммарно 201 байт — между старым пределом 400 (проходил)
+    /// и новым 150 (обязан отвергаться).
+    func testRejectsMultiComponentPathThatUsedToPassNormalizationButOverflowedMaxPath() {
+        let segment = String(repeating: "a", count: 100)
+        let onceAcceptedNowRejected = "\(segment)/\(segment)"
+        XCTAssertNil(RelPath.normalize(onceAcceptedNowRejected))
+    }
 }
