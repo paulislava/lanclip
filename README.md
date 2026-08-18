@@ -125,7 +125,12 @@ Get-Process lanclipd
 curl -s -m 5 -o /dev/null -w "http_code=%{http_code}\n" http://pc:8901/health
 # → http_code=503 (это прокси, не сосед)
 
-curl -s -m 5 --noproxy '*' -H "x-clip-token: <ваш токен>" http://pc:8901/health
+# Токен — НЕ через -H "x-clip-token: <вставленное руками значение>": так он
+# попадает в argv этого процесса, откуда виден любому локальному процессу
+# через `ps`. Передаём через stdin curl'а (-K -, формат "директива = значение")
+# и берём значение прямо из своего конфига, а не набираем вручную:
+TOKEN="$(jq -r .token ~/.config/lanclip/config.json)"
+printf 'header = "x-clip-token: %s"\n' "$TOKEN" | curl -K - -s -m 5 --noproxy '*' http://pc:8901/health
 # → {"ok":true,"host":"DESKTOP-NGNE28E","version":1} — реальный ответ агента
 ```
 Сами агенты (`lanclipd`/`lanclipd.exe`) через прокси не ходят — это касается

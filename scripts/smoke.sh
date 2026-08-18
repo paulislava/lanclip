@@ -24,6 +24,20 @@ FAIL=0
 pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
 
+# Мелкая находка финального ревью: `curl -H "x-clip-token: $TOKEN" ...` кладёт
+# токен буквально в argv этого процесса, откуда его видит любой локальный
+# пользователь/процесс через `ps`/`ps aux` на всё время жизни curl. Вместо
+# этого токен идёт curl'у через стандартный ввод как строка конфига (`curl -K -`,
+# формат "директива = значение") — `printf` здесь ЯВЛЯЕТСЯ builtin-командой
+# bash (не `/usr/bin/printf`), поэтому сам токен ни разу не попадает в таблицу
+# процессов ни в каком виде. Прочие curl-опции (`--noproxy`, `-m`, URL)
+# передаются как обычно через argv — секретов среди них нет.
+curl_with_token() {
+    local token="$1"
+    shift
+    printf 'header = "x-clip-token: %s"\n' "$token" | curl -K - "$@"
+}
+
 if ! command -v jq >/dev/null 2>&1; then
     echo "Нужен jq (brew install jq) для разбора конфига Mac." >&2
     exit 2
@@ -44,7 +58,7 @@ echo "Сосед (для проверки /health c Mac): $PEER_HOST"
 echo
 
 echo "--- 1) /health: Mac -> Mac (локально) ---"
-BODY="$(curl -s -m 5 --noproxy '*' -H "x-clip-token: $MAC_TOKEN" "http://127.0.0.1:${MAC_PORT}/health" || true)"
+BODY="$(curl_with_token "$MAC_TOKEN" -s -m 5 --noproxy '*' "http://127.0.0.1:${MAC_PORT}/health" || true)"
 echo "$BODY"
 if echo "$BODY" | jq -e '.ok == true' >/dev/null 2>&1; then
     pass "Mac /health отвечает ok=true"
@@ -54,7 +68,7 @@ fi
 echo
 
 echo "--- 2) /health: Mac -> ПК ---"
-BODY="$(curl -s -m 5 --noproxy '*' -H "x-clip-token: $MAC_TOKEN" "http://${PEER_HOST}:${MAC_PORT}/health" || true)"
+BODY="$(curl_with_token "$MAC_TOKEN" -s -m 5 --noproxy '*' "http://${PEER_HOST}:${MAC_PORT}/health" || true)"
 echo "$BODY"
 if echo "$BODY" | jq -e '.ok == true' >/dev/null 2>&1; then
     pass "ПК /health отвечает ok=true (запрошено с Mac)"
