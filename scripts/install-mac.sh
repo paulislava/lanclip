@@ -22,6 +22,7 @@ LOG_FILE="$HOME/Library/Logs/lanclip.log"
 
 PLIST_LABEL="space.paulislava.lanclip"
 PLIST_FILE="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
+USER_ID="$(id -u)"
 
 echo "==> Сборка lanclipd (release)"
 (cd "$MAC_DIR" && swift build -c release)
@@ -31,6 +32,15 @@ if [ ! -x "$BUILT_BIN" ]; then
     echo "Ошибка: бинарник не найден после сборки: $BUILT_BIN" >&2
     exit 1
 fi
+
+# Остановка агента — ДО того, как трогаем бинарник по $BIN_DEST. На повторной
+# установке там уже может жить старый процесс под KeepAlive=true: если сначала
+# усечь файл через cp -f и тут же принудительно сменить подпись под ним, у живого
+# процесса есть неконтролируемое окно, в котором система может его прибить в
+# произвольный момент — в том числе посреди pull() и записи файлов в стейджинг.
+# Агента может не быть вовсе (первая установка) — это ожидаемо и не повод падать.
+echo "==> Остановка прежнего агента (если был)"
+launchctl bootout "gui/$USER_ID/$PLIST_LABEL" 2>/dev/null || true
 
 echo "==> Установка бинарника: $BIN_DEST"
 mkdir -p "$HOME/.local/bin"
@@ -93,16 +103,32 @@ cat > "$PLIST_FILE" <<PLIST
 </plist>
 PLIST
 
-USER_ID="$(id -u)"
-
-echo "==> Перезагрузка LaunchAgent"
-# Уже загруженного агента может не быть (первая установка) — это ожидаемо и не повод падать.
-launchctl bootout "gui/$USER_ID/$PLIST_LABEL" 2>/dev/null || true
+echo "==> Загрузка LaunchAgent"
 launchctl bootstrap "gui/$USER_ID" "$PLIST_FILE"
+
+# Код возврата bootstrap подтверждает только то, что launchd принял задание, а не
+# то, что процесс держится, а не ушёл в перезапуск. Даём агенту секунду устояться
+# и явно перепроверяем "state = running" из launchctl print — именно эта проверка
+# поймала бы краш-луп (например, из-за конфига, который serve отвергает на старте),
+# если он когда-нибудь вернётся в другом виде.
+echo "==> Проверка, что агент поднялся и держится"
+STATE=""
+for attempt in 1 2 3; do
+    sleep 1
+    STATE="$(launchctl print "gui/$USER_ID/$PLIST_LABEL" 2>/dev/null | grep -m1 $'^\tstate = ' | awk '{print $3}')"
+    [ "$STATE" = "running" ] && break
+done
+
+if [ "$STATE" != "running" ]; then
+    echo "Ошибка: после bootstrap агент не в состоянии running (state=${STATE:-нет данных})." >&2
+    echo "Смотрите лог: $LOG_FILE" >&2
+    echo "И вывод: launchctl print gui/$USER_ID/$PLIST_LABEL" >&2
+    exit 1
+fi
 
 cat <<MSG
 
-Готово. lanclipd поставлен в $BIN_DEST и загружен как LaunchAgent.
+Готово. lanclipd поставлен в $BIN_DEST и загружен как LaunchAgent (state=running).
 
 Проверить:
   launchctl print gui/$USER_ID/$PLIST_LABEL
@@ -127,4 +153,6 @@ cat <<MSG
      launchctl bootstrap gui/$USER_ID $PLIST_FILE
    Разрешение привязано к пути и подписи бинарника, а не к тому, как именно
    он был запущен — дальше LaunchAgent будет работать с уже выданным доступом.
+
+Подробнее: docs/mac-setup.md
 MSG
