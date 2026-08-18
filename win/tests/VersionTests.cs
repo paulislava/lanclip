@@ -25,6 +25,8 @@ namespace LanClip.Tests
             StaExecutorTests.Register();
             HttpServerTests.Register();
             StagingTests.Register();
+            PeerResolverTests.Register();
+            PullClientTests.Register();
             return T.Summary();
         }
     }
