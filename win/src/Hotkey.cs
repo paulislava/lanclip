@@ -121,12 +121,17 @@ namespace LanClip
     // часть комбинации Ctrl+Shift+V. Если просто послать Ctrl+V поверх них,
     // приложение-получатель увидит Ctrl+Shift+V и, скорее всего, вставит как обычный
     // текст либо вовсе проигнорирует событие — это выглядело бы как «хоткей не
-    // работает», хотя сам хоткей сработал и буфер уже наполнен. Поэтому сперва явно
-    // посылается keyUp для VK_CONTROL/VK_LCONTROL/VK_RCONTROL и
-    // VK_SHIFT/VK_LSHIFT/VK_RSHIFT (общий виртуальный код клавиши и оба конкретных —
-    // на случай, если приёмник следит именно за левой/правой клавишей отдельно), даётся
-    // пауза 20мс, чтобы приёмник успел обработать снятие модификаторов, и только затем
-    // идёт Ctrl down, V down, V up, Ctrl up.
+    // работает», хотя сам хоткей сработал и буфер уже наполнен.
+    //
+    // Поэтому агент ЖДЁТ, пока пользователь сам отпустит Ctrl и Shift, и только затем
+    // посылает правый Ctrl down, V down, V up, правый Ctrl up (почему именно правый —
+    // см. комментарий в Send()). Подделывать отпускание нельзя:
+    // приложение ведёт свой учёт модификаторов по потоку событий, и искусственный
+    // keyUp для клавиши, которую человек держит, оставляет его в состоянии «Ctrl
+    // отпущен» навсегда — парного keyDown уже не будет. Следующий Ctrl+A становится
+    // для приложения обычной «a». Проверяются и общий виртуальный код, и оба
+    // конкретных: ремапы клавиш (у Павла в PowerToys левый Ctrl и левый Alt поменяны
+    // местами) делают проверку только общего кода недостаточной.
     static class Paste
     {
         const int VK_CONTROL = 0x11;
@@ -137,7 +142,15 @@ namespace LanClip
         const int VK_RSHIFT = 0xA1;
         const int VK_V = 0x56;
 
-        const int ModifierResetDelayMs = 20;
+        // Сколько ждать, пока пользователь сам отпустит модификаторы. Полторы
+        // секунды: нажатие хоткея и отпускание клавиш разделены реакцией человека,
+        // а сам pull к этому моменту уже завершён (он идёт до синтеза).
+        const int ModifierReleaseTimeoutMs = 1500;
+        const int ModifierPollIntervalMs = 15;
+
+        // Небольшая пауза после того, как модификаторы отпущены: приложение должно
+        // успеть обработать пришедшие keyUp прежде, чем получит наш Ctrl+V.
+        const int AfterReleaseSettleMs = 20;
 
         const int INPUT_KEYBOARD = 1;
         const uint KEYEVENTF_KEYUP = 0x0002;
@@ -203,6 +216,9 @@ namespace LanClip
         [DllImport("user32.dll", SetLastError = true)]
         static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
 
+        [DllImport("user32.dll")]
+        static extern short GetAsyncKeyState(int vKey);
+
         // Бросает PasteException, если SendInput отклонил хотя бы одно из десяти
         // событий последовательности — но только после того, как вся
         // последовательность целиком отправлена (см. TrySendKeyEvent): обрыв на
@@ -212,26 +228,85 @@ namespace LanClip
         {
             List<string> failures = new List<string>();
 
-            // Сброс физически зажатых модификаторов — см. комментарий класса.
-            TrySendKeyUp(VK_CONTROL, failures);
-            TrySendKeyUp(VK_LCONTROL, failures);
-            TrySendKeyUp(VK_RCONTROL, failures);
-            TrySendKeyUp(VK_SHIFT, failures);
-            TrySendKeyUp(VK_LSHIFT, failures);
-            TrySendKeyUp(VK_RSHIFT, failures);
+            // Ждём, пока пользователь сам отпустит Ctrl и Shift, вместо того чтобы
+            // подделывать их отпускание.
+            //
+            // Прежняя версия посылала keyUp для модификаторов, которые пользователь
+            // физически держит. Это ложь о состоянии клавиатуры, и она обходится
+            // дорого: приложение ведёт свой учёт модификаторов по потоку событий,
+            // получает «Ctrl отпущен», а парного keyDown не получит никогда — клавишу
+            // ведь не отпускали. Дальше приложение считает Ctrl отпущенным, и
+            // следующий Ctrl+A превращается для него в обычную «a». Именно так у
+            // Павла и ломался Ctrl+A после каждой попытки вставки.
+            //
+            // Ждать здесь можно спокойно: pull к этому моменту уже завершён, и
+            // задержка равна реакции человека, а не сети.
+            if (!WaitForModifiersRelease())
+            {
+                throw new PasteException(
+                    "Ctrl и Shift всё ещё зажаты через " + ModifierReleaseTimeoutMs
+                    + " мс — вставка не выполнена, чтобы не рассылать ложное состояние клавиш. "
+                    + "Буфер обновлён, вставьте вручную (Ctrl+V).");
+            }
 
-            Thread.Sleep(ModifierResetDelayMs);
+            Thread.Sleep(AfterReleaseSettleMs);
 
-            TrySendKeyDown(VK_CONTROL, failures);
+            // Синтезируем ПРАВЫМ Ctrl, а не общим кодом и не левым.
+            //
+            // Причина конкретная и проверена на этой машине. В PowerToys у Павла
+            // Keyboard Manager меняет местами левый Ctrl и левый Alt:
+            //     162 (LCONTROL) -> 164 (LMENU)
+            //     164 (LMENU)    -> 162 (LCONTROL)
+            // Общий VK_CONTROL при инъекции превращается драйвером в левый Ctrl, тот
+            // попадает под ремап и доходит до приложения как Alt. Пользователь видел
+            // ровно это: буфер наполняется, а вставки нет, потому что вместо Ctrl+V
+            // приложение получало Alt+V.
+            //
+            // Правый Ctrl (163) в таблице ремапов не встречается, поэтому проходит
+            // хук нетронутым. Важно, что это работает и с включённым Диспетчером
+            // клавиатуры, и с выключенным — в отличие от «синтезировать Alt+V»,
+            // которое опирается на наличие ремапа и ломается, когда его отключают.
+            TrySendKeyDown(VK_RCONTROL, failures);
             TrySendKeyDown(VK_V, failures);
             TrySendKeyUp(VK_V, failures);
-            TrySendKeyUp(VK_CONTROL, failures);
+            TrySendKeyUp(VK_RCONTROL, failures);
 
             if (failures.Count > 0)
             {
                 throw new PasteException("SendInput отклонил " + failures.Count
                     + " из 10 синтетических событий клавиатуры: " + string.Join("; ", failures.ToArray()));
             }
+        }
+
+        // true — модификаторы отпущены (или их и не держали), false — истёк таймаут.
+        // Проверяются и общий виртуальный код, и оба конкретных: раскладка и
+        // возможные ремапы клавиш (например, Keyboard Manager из PowerToys, где у
+        // Павла левый Ctrl и левый Alt поменяны местами) делают проверку только
+        // общего кода недостаточной.
+        static bool WaitForModifiersRelease()
+        {
+            int waited = 0;
+            while (waited <= ModifierReleaseTimeoutMs)
+            {
+                if (!AnyModifierDown()) { return true; }
+                Thread.Sleep(ModifierPollIntervalMs);
+                waited += ModifierPollIntervalMs;
+            }
+            return !AnyModifierDown();
+        }
+
+        static bool AnyModifierDown()
+        {
+            return IsDown(VK_CONTROL) || IsDown(VK_LCONTROL) || IsDown(VK_RCONTROL)
+                || IsDown(VK_SHIFT) || IsDown(VK_LSHIFT) || IsDown(VK_RSHIFT);
+        }
+
+        // GetAsyncKeyState отражает физическое состояние клавиши, а не состояние
+        // очереди сообщений — именно это нам и нужно: мы ждём, пока человек реально
+        // разожмёт пальцы.
+        static bool IsDown(int vk)
+        {
+            return (GetAsyncKeyState(vk) & 0x8000) != 0;
         }
 
         static void TrySendKeyDown(int vk, List<string> failures)
