@@ -74,10 +74,21 @@ public struct Config: Codable, Equatable, Sendable {
         }
     }
 
+    /// Общие для всех команд проверки: порт, токен, лимит размера. Не проверяет `peers` —
+    /// сервер без единого соседа (`serve`/`status`) совершенно законное состояние сразу
+    /// после установки, до того как обе машины познакомятся друг с другом (задача 26).
+    /// Соседа требуют только команды, которым он реально нужен — см. `validatePeers()`.
     public func validate() throws {
         guard port > 0, port < 65_536 else { throw ConfigError.invalidPort(port) }
         guard !token.isEmpty else { throw ConfigError.emptyToken }
-        guard !peers.isEmpty else { throw ConfigError.noPeers }
         guard maxBytes > 0 else { throw ConfigError.invalidMaxBytes(maxBytes) }
+    }
+
+    /// Отдельная проверка для команд, которым без соседа делать нечего (`get`, `pull`).
+    /// Не часть `validate()`: тот вызывается всеми командами подряд, включая `serve` и
+    /// `status`, которым пустой `peers` не мешает — сервер отдаёт свой буфер и без
+    /// сконфигурированного соседа.
+    public func validatePeers() throws {
+        guard !peers.isEmpty else { throw ConfigError.noPeers }
     }
 }

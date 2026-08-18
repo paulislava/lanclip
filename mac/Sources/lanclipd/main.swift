@@ -152,7 +152,7 @@ func runStatus(configURL: URL) {
 }
 
 func runGet(configURL: URL) {
-    let config = loadValidatedConfig(at: configURL)
+    let config = loadConfigRequiringPeers(at: configURL)
     let resolver = PeerResolver(config: config, prober: NwHttpClient())
 
     guard let peer = resolver.resolve() else {
@@ -176,7 +176,7 @@ func runGet(configURL: URL) {
 }
 
 func runPull(configURL: URL) {
-    let config = loadValidatedConfig(at: configURL)
+    let config = loadConfigRequiringPeers(at: configURL)
     let resolver = PeerResolver(config: config, prober: NwHttpClient())
     let fetcher = NwHttpClient()
     let staging = Staging(root: Staging.defaultRoot)
@@ -204,6 +204,20 @@ func loadValidatedConfig(at url: URL) -> Config {
         printErr(configErrorMessage(error, configURL: url))
         exit(1)
     }
+}
+
+/// Для `get`/`pull` — команд, которым без соседа делать нечего. Общие проверки те же,
+/// что и у всех (`loadValidatedConfig`), плюс отдельно `peers`: `serve` и `status`
+/// этой проверки не делают, им пустой `peers` не мешает работать.
+func loadConfigRequiringPeers(at url: URL) -> Config {
+    let config = loadValidatedConfig(at: url)
+    do {
+        try config.validatePeers()
+    } catch {
+        printErr(configErrorMessage(error, configURL: url))
+        exit(1)
+    }
+    return config
 }
 
 func configErrorMessage(_ error: Error, configURL: URL) -> String {

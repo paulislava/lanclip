@@ -74,16 +74,31 @@ final class ConfigTests: XCTestCase {
         XCTAssertThrowsError(try Config(token: "", peers: ["pc"]).validate()) { error in
             XCTAssertEqual(error as? ConfigError, .emptyToken)
         }
-        XCTAssertThrowsError(try Config(token: "t", peers: []).validate()) { error in
-            XCTAssertEqual(error as? ConfigError, .noPeers)
-        }
         XCTAssertThrowsError(try Config(token: "t", peers: ["pc"], maxBytes: 0).validate()) { error in
             XCTAssertEqual(error as? ConfigError, .invalidMaxBytes(0))
         }
     }
 
+    // `validate()` больше не проверяет `peers` — сервер без соседа (`serve`/`status`)
+    // законное состояние сразу после установки, до знакомства машин друг с другом.
+    func testValidateAcceptsEmptyPeers() throws {
+        try Config(token: "t", peers: []).validate()
+    }
+
     func testValidateAcceptsGoodConfig() throws {
         try Config(token: "t", peers: ["pc"]).validate()
+    }
+
+    // Соседа требуют только команды, которым он реально нужен (`get`/`pull`) — эта
+    // проверка вынесена в отдельный метод, а не в общий `validate()`.
+    func testValidatePeersRejectsEmptyPeers() {
+        XCTAssertThrowsError(try Config(token: "t", peers: []).validatePeers()) { error in
+            XCTAssertEqual(error as? ConfigError, .noPeers)
+        }
+    }
+
+    func testValidatePeersAcceptsNonEmptyPeers() throws {
+        try Config(token: "t", peers: ["pc"]).validatePeers()
     }
 
     func testPreservesRestrictivePermissionsOnUpdate() throws {
