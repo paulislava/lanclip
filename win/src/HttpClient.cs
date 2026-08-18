@@ -100,6 +100,16 @@ namespace LanClip
         // а не отдельно придуманное число, чтобы оба клиента были согласованы.
         const long DefaultMaxResponseBytes = Config.DefaultMaxBytes;
 
+        // Находка финального ревью (закрытие): раньше .NET просто не трогал
+        // HttpWebRequest.ReadWriteTimeout и жил на его дефолте — 300000мс, то же
+        // самое число, что и NwHttpClient.defaultProgressTimeout на Mac
+        // (mac/Sources/LanClipCore/HttpClient.swift), но НЕЯВНО, случайным
+        // совпадением дефолтов двух независимых платформ. Правка дефолта .NET
+        // Framework в будущем (или смена рантайма) молча разошлась бы с Mac.
+        // Здесь число выставляется явно, чтобы контракт "обе стороны ждут между
+        // чанками одно и то же время" был частью кода, а не совпадением.
+        const int ReadWriteTimeoutMs = 300000;
+
         readonly int timeoutMs;
         readonly long maxResponseBytes;
 
@@ -252,6 +262,7 @@ namespace LanClip
             request.Method = "GET";
             request.Headers["X-Clip-Token"] = token;
             request.Timeout = requestTimeoutMs;
+            request.ReadWriteTimeout = ReadWriteTimeoutMs;
             request.KeepAlive = false;
             // Находка I5 финального ревью: HttpWebRequest по умолчанию следует
             // редиректам, и в .NET Framework при этом переносит кастомные

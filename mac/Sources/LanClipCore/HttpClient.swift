@@ -50,9 +50,10 @@ public final class NwHttpClient: HealthProbing, BlobFetching, @unchecked Sendabl
     private static let maxHeaderBytes = 65_536
 
     /// Дефолт зеркалит `HttpWebRequest.ReadWriteTimeout` на Windows-стороне
-    /// (`win/src/HttpClient.cs`, `WebBlobFetcher.ReadWriteTimeoutMs`) — обе платформы
-    /// теперь явно используют одно и то же число для одной и той же фазы передачи,
-    /// а не совпадают по умолчанию случайно.
+    /// (`win/src/HttpClient.cs`, `WebBlobFetcher.ReadWriteTimeoutMs`, устанавливается
+    /// явно на `request.ReadWriteTimeout` в `Perform()`) — обе платформы теперь явно
+    /// используют одно и то же число для одной и той же фазы передачи, а не
+    /// совпадают по умолчанию случайно.
     public static let defaultProgressTimeout: TimeInterval = 300
 
     /// Сколько ждать БЕЗ единого байта ответа — от старта соединения до первого

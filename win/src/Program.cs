@@ -238,6 +238,13 @@ namespace LanClip
 
                 Console.WriteLine("Порт: " + config.Port);
 
+                // Находка финального ревью (закрытие): симметрично Mac-стороннему
+                // runStatus (mac/Sources/lanclipd/main.swift) — "Сосед не найден"
+                // ниже осознанно НЕ считается отказом самой команды status (сосед
+                // может быть просто выключен), а вот неспособность прочитать
+                // СОБСТВЕННЫЙ буфер — настоящий сбой, о котором вызывающий
+                // скрипт/человек должен узнать по коду выхода, а не только по тексту.
+                bool bufferReadFailed = false;
                 try
                 {
                     ClipSnapshot snapshot = snapshots.Current();
@@ -246,6 +253,7 @@ namespace LanClip
                 catch (Exception e)
                 {
                     Console.WriteLine("Буфер: не удалось прочитать (" + Describe(e) + ")");
+                    bufferReadFailed = true;
                 }
 
                 WebBlobFetcher prober = new WebBlobFetcher(FetchTimeoutMs);
@@ -258,6 +266,11 @@ namespace LanClip
                 else
                 {
                     Console.WriteLine(NoPeerMessage(resolver));
+                }
+
+                if (bufferReadFailed)
+                {
+                    return 1;
                 }
             }
             finally
