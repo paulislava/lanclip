@@ -339,6 +339,56 @@ final class HttpServerTests: XCTestCase {
         XCTAssertEqual(healthResponse.status, 200)
     }
 
+    /// C1 (находка финального ревью): соединение, которое ничего не посылает,
+    /// раньше держало файловый дескриптор и `NWConnection` бессрочно — по
+    /// исчерпании лимита дескрипторов listener переставал принимать новые
+    /// соединения. Дедлайн на получение полного запроса обязан закрыть такое
+    /// соединение сам, не дожидаясь глобального таймаута теста, и не мешать
+    /// серверу обслуживать дальнейшие нормальные запросы.
+    func testIdleConnectionIsClosedByDeadlineAndServerStaysAlive() throws {
+        let store = makeStore()
+        let server = HttpServer(config: makeConfig(), snapshots: store, hostName: "mac",
+                                 requestDeadline: 0.3, pull: succeedingPull)
+        try server.start()
+        defer { server.stop() }
+
+        let idle = openConnection(port: server.boundPort)
+        defer { idle.cancel() }
+
+        let closed = expectation(description: "idle connection closed by server deadline")
+        idle.receive(minimumIncompleteLength: 1, maximumLength: 1) { _, _, isComplete, error in
+            if isComplete || error != nil {
+                closed.fulfill()
+            }
+        }
+        wait(for: [closed], timeout: 3)
+
+        // Сервер обязан продолжать обслуживать дальнейшие соединения после того,
+        // как закрыл зависшее.
+        let healthy = openConnection(port: server.boundPort)
+        defer { healthy.cancel() }
+        let raw = Data("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Clip-Token: \(testToken)\r\n\r\n".utf8)
+        let response = try sendAndReadResponse(healthy, raw: raw)
+        XCTAssertEqual(response.status, 200)
+    }
+
+    /// Симметрично: соединение, УСПЕВШЕЕ прислать полный запрос до дедлайна,
+    /// обязано получить нормальный ответ, а не быть оборванным гонкой с таймером
+    /// (защита от `deadline.cancel()`, забытого на успешном пути).
+    func testConnectionCompletingBeforeDeadlineIsServedNormally() throws {
+        let store = makeStore()
+        let server = HttpServer(config: makeConfig(), snapshots: store, hostName: "mac",
+                                 requestDeadline: 0.3, pull: succeedingPull)
+        try server.start()
+        defer { server.stop() }
+
+        let connection = openConnection(port: server.boundPort)
+        defer { connection.cancel() }
+        let raw = Data("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Clip-Token: \(testToken)\r\n\r\n".utf8)
+        let response = try sendAndReadResponse(connection, raw: raw)
+        XCTAssertEqual(response.status, 200)
+    }
+
     func testLargeBlobIsDeliveredInFullOverChunkedSend() throws {
         let file = directory.appendingPathComponent("large.bin")
         let payload = Data((0..<700_000).map { UInt8($0 % 256) })

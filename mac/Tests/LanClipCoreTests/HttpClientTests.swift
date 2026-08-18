@@ -165,6 +165,84 @@ final class HttpClientTests: XCTestCase {
         func stop() { listener.cancel() }
     }
 
+    /// I2 (находка финального ревью): `timeout` раньше был бюджетом на ВЕСЬ блоб
+    /// целиком — семафор заводился до старта соединения и снимался только когда
+    /// тело было записано полностью. Слушатель здесь шлёт байты чанками с паузами
+    /// МЕНЬШЕ `timeout`, но суммарное время передачи БОЛЬШЕ `timeout` — старая
+    /// реализация оборвала бы такую передачу как `.timeout`, хотя прогресс шёл
+    /// постоянно. Дедлайн обязан сбрасываться при каждом полученном чанке.
+    private final class SlowTricklingListener: @unchecked Sendable {
+        private let listener: NWListener
+        private var connections: [NWConnection] = []
+        private let queue = DispatchQueue(label: "trickling-listener-test")
+
+        init(chunks: [Data], interChunkDelay: TimeInterval) throws {
+            listener = try NWListener(using: .tcp, on: .any)
+            let ready = DispatchSemaphore(value: 0)
+            listener.newConnectionHandler = { [weak self] connection in
+                guard let self else { return }
+                connection.start(queue: self.queue)
+                self.connections.append(connection)
+                self.drainRequestThenSend(connection, chunks: chunks, interChunkDelay: interChunkDelay)
+            }
+            listener.stateUpdateHandler = { state in
+                if case .ready = state { ready.signal() }
+            }
+            listener.start(queue: queue)
+            guard ready.wait(timeout: .now() + 5) == .success else {
+                throw HttpServerError.listenerTimedOut
+            }
+        }
+
+        var port: Int { Int(listener.port?.rawValue ?? 0) }
+
+        func stop() { listener.cancel() }
+
+        /// Не разбирает запрос по-настоящему — просто ждёт, пока клиент замолчит
+        /// (одно `receive`, достаточно для одного маленького GET без тела), затем
+        /// шлёт чанки тела с задержкой между ними.
+        private func drainRequestThenSend(_ connection: NWConnection, chunks: [Data], interChunkDelay: TimeInterval) {
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] _, _, _, _ in
+                guard let self else { return }
+                let totalBody = chunks.reduce(0) { $0 + $1.count }
+                let head = Data("HTTP/1.1 200 OK\r\nContent-Length: \(totalBody)\r\n\r\n".utf8)
+                connection.send(content: head, completion: .contentProcessed { _ in
+                    self.sendChunks(connection, chunks: chunks, interChunkDelay: interChunkDelay)
+                })
+            }
+        }
+
+        private func sendChunks(_ connection: NWConnection, chunks: [Data], interChunkDelay: TimeInterval) {
+            guard let first = chunks.first else { return }
+            let rest = Array(chunks.dropFirst())
+            connection.send(content: first, completion: .contentProcessed { [weak self] _ in
+                guard let self, !rest.isEmpty else { return }
+                self.queue.asyncAfter(deadline: .now() + interChunkDelay) {
+                    self.sendChunks(connection, chunks: rest, interChunkDelay: interChunkDelay)
+                }
+            })
+        }
+    }
+
+    func testProgressResetsDeadlineForLongTricklingTransfer() throws {
+        // 6 чанков, пауза 0.35с между ними — суммарно ~1.75с, заметно больше
+        // `timeout: 0.5`, но каждая пауза меньше него: с "прогресс сбрасывает
+        // дедлайн" передача обязана дойти до конца, а не оборваться по старому,
+        // фиксированному на весь вызов бюджету.
+        let chunk = Data(repeating: 0xAB, count: 1_000)
+        let chunks = Array(repeating: chunk, count: 6)
+        let slow = try SlowTricklingListener(chunks: chunks, interChunkDelay: 0.35)
+        defer { slow.stop() }
+
+        let patientClient = NwHttpClient(timeout: 0.5, progressTimeout: 5)
+        let destination = directory.appendingPathComponent("trickled.bin")
+        let result = try patientClient.blob(host: "127.0.0.1", port: slow.port, token: testToken,
+                                             index: 0, seq: 0, to: destination)
+        XCTAssertNil(result)
+        let written = try Data(contentsOf: destination)
+        XCTAssertEqual(written.count, chunks.count * chunk.count)
+    }
+
     func testTimeoutFiresAndCancelsConnectionWithoutCrashing() throws {
         let silent = try SilentListener()
         defer { silent.stop() }

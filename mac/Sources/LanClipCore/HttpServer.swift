@@ -29,11 +29,21 @@ public final class HttpServer: @unchecked Sendable {
     /// блоб может весить сотни мегабайт.
     private static let sendChunkSize = 262_144
     private static let listenerReadyTimeout: TimeInterval = 5
+    /// Дефолтный дедлайн на получение ПОЛНОГО запроса с момента accept() соединения
+    /// (находка C1 финального ревью). `receive(on:buffer:remote:deadline:)` ждёт
+    /// данные без собственного таймаута — молчащее соединение (любой хост в
+    /// подсети, открывший сокет и ничего не пославший) держало бы файловый
+    /// дескриптор и `NWConnection` бессрочно; по исчерпании лимита дескрипторов
+    /// listener перестаёт принимать новые соединения, а процесс формально жив, так
+    /// что `KeepAlive` в LaunchAgent его не перезапустит. Windows-сторона этим не
+    /// болеет: `HttpListener.TimeoutManager` по умолчанию рвёт такие соединения сама.
+    public static let defaultRequestDeadline: TimeInterval = 8
 
     private let config: Config
     private let snapshots: SnapshotStore
     private let hostName: String
     private let pull: () throws -> PullResult
+    private let requestDeadline: TimeInterval
 
     private let queue = DispatchQueue(label: "lanclip.httpserver")
     private let stateLock = NSLock()
@@ -41,10 +51,12 @@ public final class HttpServer: @unchecked Sendable {
     private var _boundPort: Int = 0
 
     public init(config: Config, snapshots: SnapshotStore, hostName: String,
+                requestDeadline: TimeInterval = HttpServer.defaultRequestDeadline,
                 pull: @escaping () throws -> PullResult) {
         self.config = config
         self.snapshots = snapshots
         self.hostName = hostName
+        self.requestDeadline = requestDeadline
         self.pull = pull
     }
 
@@ -116,10 +128,23 @@ public final class HttpServer: @unchecked Sendable {
 
     private func accept(_ connection: NWConnection) {
         connection.start(queue: queue)
-        receive(on: connection, buffer: Data(), remote: HttpServer.remoteAddress(of: connection))
+
+        // Дедлайн заводится на очереди сервера (та же `queue`, на которой приходят
+        // колбэки `receive`) и отменяется, как только запрос разобран целиком —
+        // успешно, с ошибкой разбора или по превышению `maxIncomingRequestBytes`.
+        // Если ничего из этого не случилось за `requestDeadline`, таймер сам
+        // отменяет соединение. `[weak connection]` — на случай, если соединение уже
+        // отменилось и освободилось к моменту срабатывания таймера; повторный
+        // `cancel()` на уже отменённом `NWConnection` безопасен и является no-op.
+        let deadline = RequestDeadline { [weak connection] in
+            connection?.cancel()
+        }
+        queue.asyncAfter(deadline: .now() + requestDeadline, execute: deadline.workItem)
+
+        receive(on: connection, buffer: Data(), remote: HttpServer.remoteAddress(of: connection), deadline: deadline)
     }
 
-    private func receive(on connection: NWConnection, buffer: Data, remote: String) {
+    private func receive(on connection: NWConnection, buffer: Data, remote: String, deadline: RequestDeadline) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, isComplete, error in
             guard let self else { return }
 
@@ -129,22 +154,26 @@ public final class HttpServer: @unchecked Sendable {
             }
 
             if buffer.count > Self.maxIncomingRequestBytes {
+                deadline.cancel()
                 self.respond(.empty(400), on: connection)
                 return
             }
 
             do {
                 let request = try parseHttpRequest(buffer)
+                deadline.cancel()
                 let response = HttpServer.route(request, config: self.config, snapshots: self.snapshots,
                                                  hostName: self.hostName, remote: remote, pull: self.pull)
                 self.respond(response, on: connection)
             } catch HttpParseError.incomplete {
                 if isComplete || error != nil {
+                    deadline.cancel()
                     connection.cancel()
                     return
                 }
-                self.receive(on: connection, buffer: buffer, remote: remote)
+                self.receive(on: connection, buffer: buffer, remote: remote, deadline: deadline)
             } catch {
+                deadline.cancel()
                 self.respond(.empty(400), on: connection)
             }
         }
@@ -292,4 +321,22 @@ public enum HttpServerError: Error, Equatable {
 /// поток. Доступ сериализован семафором в `start()`, поэтому гонок нет.
 private final class StartOutcomeBox: @unchecked Sendable {
     var error: Error?
+}
+
+/// Оборачивает `DispatchWorkItem` (не `Sendable`) для дедлайна на получение
+/// полного запроса (находка C1). Весь доступ — планирование через
+/// `queue.asyncAfter`, `cancel()` из колбэков `receive` — происходит на одной и
+/// той же серийной очереди сервера, поэтому гонок нет; обёртка нужна только
+/// затем, чтобы компилятор не отказывался захватывать `DispatchWorkItem` в
+/// `@Sendable`-замыкании `receive`.
+private final class RequestDeadline: @unchecked Sendable {
+    let workItem: DispatchWorkItem
+
+    init(_ body: @escaping () -> Void) {
+        workItem = DispatchWorkItem(block: body)
+    }
+
+    func cancel() {
+        workItem.cancel()
+    }
 }

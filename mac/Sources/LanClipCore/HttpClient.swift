@@ -34,11 +34,30 @@ public final class NwHttpClient: HealthProbing, BlobFetching, @unchecked Sendabl
     /// без `\r\n\r\n`, а не реальный лимит для нормальной работы.
     private static let maxHeaderBytes = 65_536
 
+    /// Дефолт зеркалит `HttpWebRequest.ReadWriteTimeout` на Windows-стороне
+    /// (`win/src/HttpClient.cs`, `WebBlobFetcher.ReadWriteTimeoutMs`) — обе платформы
+    /// теперь явно используют одно и то же число для одной и той же фазы передачи,
+    /// а не совпадают по умолчанию случайно.
+    public static let defaultProgressTimeout: TimeInterval = 300
+
+    /// Сколько ждать БЕЗ единого байта ответа — от старта соединения до первого
+    /// полученного чанка. Зеркало `HttpWebRequest.Timeout` на Windows (время до
+    /// заголовков ответа).
     private let timeout: TimeInterval
+    /// Сколько ждать МЕЖДУ последовательными чанками уже начавшегося ответа — сбрасывается
+    /// при каждом полученном чанке (находка I2 финального ревью). Раньше `timeout`
+    /// был бюджетом на ВЕСЬ блоб целиком: семафор заводился до старта соединения и
+    /// снимался только когда тело было записано полностью, так что передача блоба
+    /// больше ~50–200 МБ по Wi-Fi гарантированно упиралась в дефолтные 10 секунд,
+    /// даже если данные исправно текли. Windows этой болезни не знал: `request.Timeout`
+    /// у него относится только к получению ответа (до заголовков), а чтение тела идёт
+    /// под `ReadWriteTimeout`, применяемым к каждому отдельному чтению потока.
+    private let progressTimeout: TimeInterval
     private let queue = DispatchQueue(label: "lanclip.httpclient")
 
-    public init(timeout: TimeInterval = 10) {
+    public init(timeout: TimeInterval = 10, progressTimeout: TimeInterval = NwHttpClient.defaultProgressTimeout) {
         self.timeout = timeout
+        self.progressTimeout = progressTimeout
     }
 
     // MARK: - HealthProbing
@@ -156,8 +175,30 @@ public final class NwHttpClient: HealthProbing, BlobFetching, @unchecked Sendabl
 
         connection.start(queue: queue)
 
-        let waitResult = semaphore.wait(timeout: .now() + timeout)
-        if waitResult == .timedOut {
+        // Дедлайн больше не фиксированная точка на весь вызов: пока не пришло ни
+        // байта ответа, окно — `timeout` (время на соединение и первый чанк); как
+        // только `receiveInMemory`/`receiveHeadThenStream`/`pumpBodyToFile` фиксируют
+        // хоть один полученный чанк через `box.recordProgress()`, окно переключается
+        // на `progressTimeout` и отсчитывается заново от последнего чанка — большой
+        // блоб, который продолжает течь, никогда не упрётся в `timeout`, но
+        // застрявшая на середине передача всё равно оборвётся не позже
+        // `progressTimeout` после последнего байта.
+        let pollInterval: TimeInterval = 0.5
+        var timedOut = false
+        while true {
+            let (lastActivity, hasProgress) = box.activitySnapshot()
+            let window = hasProgress ? progressTimeout : timeout
+            let remaining = lastActivity.addingTimeInterval(window).timeIntervalSinceNow
+            if remaining <= 0 {
+                timedOut = true
+                break
+            }
+            if semaphore.wait(timeout: .now() + min(remaining, pollInterval)) == .success {
+                break
+            }
+        }
+
+        if timedOut {
             // Помечаем исход зафиксированным ДО cancel(): колбэк `.cancelled`/поздний
             // колбэк чтения, который сработает уже после этого момента, увидит
             // `trySettle` вернувшим false и не станет сигналить семафор, по которому
@@ -210,7 +251,10 @@ public final class NwHttpClient: HealthProbing, BlobFetching, @unchecked Sendabl
                                          box: OutcomeBox, semaphore: DispatchSemaphore) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, isComplete, error in
             var buffer = buffer
-            if let data { buffer.append(data) }
+            if let data, !data.isEmpty {
+                buffer.append(data)
+                box.recordProgress()
+            }
 
             if buffer.count > maxInMemoryResponseBytes {
                 if box.trySettle(.failure(.transport("ответ превысил предел \(maxInMemoryResponseBytes) байт в памяти"))) {
@@ -271,7 +315,10 @@ public final class NwHttpClient: HealthProbing, BlobFetching, @unchecked Sendabl
                                                box: OutcomeBox, semaphore: DispatchSemaphore) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, isComplete, error in
             var buffer = buffer
-            if let data { buffer.append(data) }
+            if let data, !data.isEmpty {
+                buffer.append(data)
+                box.recordProgress()
+            }
 
             if buffer.count > maxHeaderBytes {
                 if box.trySettle(.failure(.transport("заголовки ответа превысили предел \(maxHeaderBytes) байт"))) {
@@ -360,6 +407,7 @@ public final class NwHttpClient: HealthProbing, BlobFetching, @unchecked Sendabl
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, isComplete, error in
             var written = written
             if let data, !data.isEmpty {
+                box.recordProgress()
                 let remaining = declaredLength - written
                 if remaining > 0 {
                     let chunk = Data(data.prefix(remaining))
@@ -409,6 +457,31 @@ public final class NwHttpClient: HealthProbing, BlobFetching, @unchecked Sendabl
         private var settled = false
         private var requestSent = false
         private var result: Result<PerformOutcome, HttpClientError>?
+        /// Момент последнего полученного чанка ответа; инициализируется временем
+        /// создания ячейки (то есть примерно временем старта соединения), чтобы до
+        /// первого чанка окно ожидания в `perform()` отсчитывалось от начала вызова.
+        private var lastActivity = Date()
+        /// Хоть один непустой чанк ответа уже получен — переключает окно ожидания в
+        /// `perform()` с `timeout` (время на соединение и первый байт) на
+        /// `progressTimeout` (время между последовательными чанками).
+        private var hasProgress = false
+
+        /// Фиксирует получение непустого чанка данных — сбрасывает "часы бездействия"
+        /// для дедлайна `perform()`. Вызывается из колбэков `receive` на очереди сети.
+        func recordProgress() {
+            lock.lock()
+            lastActivity = Date()
+            hasProgress = true
+            lock.unlock()
+        }
+
+        /// Снимок для цикла ожидания в `perform()`: момент последней активности и то,
+        /// была ли уже хоть какая-то активность (то есть какое окно ожидания сейчас в силе).
+        func activitySnapshot() -> (lastActivity: Date, hasProgress: Bool) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (lastActivity, hasProgress)
+        }
 
         /// Возвращает true только при первом вызове — защита от повторной отправки
         /// запроса, если `.ready` наступит второй раз (см. комментарий у вызова).
