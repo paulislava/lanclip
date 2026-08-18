@@ -304,11 +304,16 @@ final class PullClientTests: XCTestCase {
     }
 
     // MARK: - Ruling 1: манифест соседа не проверяется на межполевые инварианты
+    //
+    // Самопротиворечивый манифест — не гонка с соседским буфером (та ловится через
+    // 409 и обрабатывается как .changedMidTransfer без сброса кеша). Это дефект
+    // кодировщика на той стороне либо подделка: повтор тому же соседу воспроизведёт
+    // то же самое, поэтому здесь всегда .transport(...) и всегда resolver.invalidate().
 
-    func testManifestWithImageKindButNoBlobsIsTreatedAsChangedMidTransfer() throws {
-        // Ruling 1: `Manifest.decode` разбирает `{"kind":"image","seq":1}` без `blobs`
-        // совершенно успешно — PullClient обязан отловить это сам, а не писать пустоту
-        // в буфер и не выглядеть успехом.
+    func testManifestWithImageKindButNoBlobsIsTreatedAsCorruptedTransport() throws {
+        // `Manifest.decode` разбирает `{"kind":"image","seq":1}` без `blobs` совершенно
+        // успешно — PullClient обязан отловить это сам, а не писать пустоту в буфер и не
+        // выглядеть успехом.
         let raw = Data(#"{"kind":"image","seq":1}"#.utf8)
         let manifest = try Manifest.decode(raw)
         XCTAssertNil(manifest.blobs) // подтверждаем предпосылку ревью — decode не падает
@@ -318,20 +323,27 @@ final class PullClientTests: XCTestCase {
         fetcher.manifestResult = .success(manifest)
         let writer = FakeClipboard()
         writer.content = .text("прежнее содержимое")
-        let (client, resolver) = makeClient(config: config, prober: FakeProber(), fetcher: fetcher, writer: writer)
+        let prober = FakeProber(alive: true)
+        let (client, resolver) = makeClient(config: config, prober: prober, fetcher: fetcher, writer: writer)
+
+        XCTAssertEqual(resolver.resolve(), "10.0.0.2")
 
         XCTAssertThrowsError(try client.pull()) { error in
-            XCTAssertEqual(error as? PullError, .changedMidTransfer)
+            guard case .transport = error as? PullError else {
+                return XCTFail("ожидали .transport, получили \(error)")
+            }
         }
         XCTAssertTrue(writer.written.isEmpty)
         XCTAssertEqual(writer.content, .text("прежнее содержимое"))
         XCTAssertEqual(fetcher.blobCallIndexes, [], "блоб не должен запрашиваться для сорванного манифеста")
 
-        // Сорванный манифест — не сбой сети, сосед жив: кеш резолвера остаётся.
-        XCTAssertEqual(resolver.resolve(), "10.0.0.2")
+        // Самопротиворечивый манифест сбрасывает кеш резолвера наравне с прочими
+        // ошибками транспорта — доказываем через наблюдаемое поведение PeerResolver.
+        prober.setAlive(false)
+        XCTAssertNil(resolver.resolve(), "манифест без обязательных blobs обязан сбрасывать кеш резолвера")
     }
 
-    func testManifestWithTextKindButNoTextIsTreatedAsChangedMidTransfer() throws {
+    func testManifestWithTextKindButNoTextIsTreatedAsCorruptedTransport() throws {
         let raw = Data(#"{"kind":"text","seq":1}"#.utf8)
         let manifest = try Manifest.decode(raw)
         XCTAssertNil(manifest.text)
@@ -343,12 +355,14 @@ final class PullClientTests: XCTestCase {
         let (client, _) = makeClient(config: config, prober: FakeProber(), fetcher: fetcher, writer: writer)
 
         XCTAssertThrowsError(try client.pull()) { error in
-            XCTAssertEqual(error as? PullError, .changedMidTransfer)
+            guard case .transport = error as? PullError else {
+                return XCTFail("ожидали .transport, получили \(error)")
+            }
         }
         XCTAssertTrue(writer.written.isEmpty)
     }
 
-    func testManifestWithFilesKindButEmptyBlobsIsTreatedAsChangedMidTransfer() throws {
+    func testManifestWithFilesKindButEmptyBlobsIsTreatedAsCorruptedTransport() throws {
         let raw = Data(#"{"kind":"files","seq":1,"blobs":[]}"#.utf8)
         let manifest = try Manifest.decode(raw)
 
@@ -359,9 +373,134 @@ final class PullClientTests: XCTestCase {
         let (client, _) = makeClient(config: config, prober: FakeProber(), fetcher: fetcher, writer: writer)
 
         XCTAssertThrowsError(try client.pull()) { error in
-            XCTAssertEqual(error as? PullError, .changedMidTransfer)
+            guard case .transport = error as? PullError else {
+                return XCTFail("ожидали .transport, получили \(error)")
+            }
         }
         XCTAssertTrue(writer.written.isEmpty)
+    }
+
+    // MARK: - Ревью раунда 2: totalSize не может быть числом, которое сосед сам себе назначает
+
+    func testManifestWithTotalSizeMismatchingBlobsSumIsTreatedAsCorruptedTransport() throws {
+        // Сосед мог бы прислать заведомо маленький totalSize при огромных blobs —
+        // прежде проверка размера (`manifest.totalSize ?? 0 > maxBytes`) доверяла этому
+        // числу напрямую и тривиально проходила. Расхождение totalSize с суммой по
+        // blobs — это тот же класс дефекта, что и отсутствующие blobs (Ruling 1):
+        // самопротиворечивый манифест, а не гонка с соседским буфером.
+        let raw = Data(#"{"kind":"files","seq":1,"totalSize":1,"blobs":[{"i":0,"rel":"big.bin","size":999999999,"mime":null}]}"#.utf8)
+        let manifest = try Manifest.decode(raw)
+        XCTAssertEqual(manifest.totalSize, 1) // decode берёт присланное число как есть, без проверки
+
+        let config = makeConfig()
+        let fetcher = FakeFetcher()
+        fetcher.manifestResult = .success(manifest)
+        let writer = FakeClipboard()
+        let prober = FakeProber(alive: true)
+        let (client, resolver) = makeClient(config: config, prober: prober, fetcher: fetcher, writer: writer)
+
+        XCTAssertEqual(resolver.resolve(), "10.0.0.2")
+
+        XCTAssertThrowsError(try client.pull()) { error in
+            guard case .transport = error as? PullError else {
+                return XCTFail("ожидали .transport, получили \(error)")
+            }
+        }
+        XCTAssertTrue(writer.written.isEmpty)
+        XCTAssertEqual(fetcher.blobCallIndexes, [],
+                       "загрузка не должна начинаться для манифеста с расходящимся totalSize")
+
+        prober.setAlive(false)
+        XCTAssertNil(resolver.resolve(), "расхождение totalSize с суммой blobs обязано сбрасывать кеш резолвера")
+    }
+
+    func testComputedTotalSizeFromBlobsGovernsTooLargeEvenWhenManifestOmitsTotalSize() throws {
+        // Симметричная проверка: даже когда манифест вовсе не содержит totalSize (а не
+        // содержит неверный), лимит maxBytes обязан сработать по сумме, посчитанной
+        // нами по blobs, а не тривиально пройти из-за `manifest.totalSize ?? 0 == 0`.
+        let raw = Data(#"{"kind":"files","seq":1,"blobs":[{"i":0,"rel":"big.bin","size":999999999,"mime":null}]}"#.utf8)
+        let manifest = try Manifest.decode(raw)
+        XCTAssertNil(manifest.totalSize) // подтверждаем предпосылку — поле в JSON отсутствует
+
+        let config = makeConfig(maxBytes: 10)
+        let fetcher = FakeFetcher()
+        fetcher.manifestResult = .success(manifest)
+        let writer = FakeClipboard()
+        let (client, _) = makeClient(config: config, prober: FakeProber(), fetcher: fetcher, writer: writer)
+
+        XCTAssertThrowsError(try client.pull()) { error in
+            XCTAssertEqual(error as? PullError, .tooLarge(totalSize: 999_999_999, maxBytes: 10))
+        }
+        XCTAssertTrue(writer.written.isEmpty)
+        XCTAssertEqual(fetcher.blobCallIndexes, [], "загрузка не должна начинаться при превышении лимита")
+    }
+
+    // MARK: - Ревью раунда 2: фактический размер блоба сверяется с обещанным в манифесте
+
+    func testFileArrivingWithWrongSizeIsTreatedAsCorruptedTransport() throws {
+        // Сосед может честно объявить totalSize, но прислать по конкретному блобу не
+        // то количество байт, что обещано в blob.size — Content-Length одного ответа
+        // никак не связан с манифестом. Ловим это после записи файла на диск.
+        let config = makeConfig()
+        let fetcher = FakeFetcher()
+        let blobs = [BlobRef(i: 0, rel: "a.txt", size: 5)]
+        fetcher.manifestResult = .success(.files(blobs, seq: 1))
+        fetcher.blobResults[0] = .success(Data("hello world".utf8)) // 11 байт вместо заявленных 5
+        let writer = FakeClipboard()
+        let prober = FakeProber(alive: true)
+        let (client, resolver) = makeClient(config: config, prober: prober, fetcher: fetcher, writer: writer)
+
+        XCTAssertEqual(resolver.resolve(), "10.0.0.2")
+
+        XCTAssertThrowsError(try client.pull()) { error in
+            guard case .transport = error as? PullError else {
+                return XCTFail("ожидали .transport, получили \(error)")
+            }
+        }
+        XCTAssertTrue(writer.written.isEmpty)
+
+        prober.setAlive(false)
+        XCTAssertNil(resolver.resolve(), "файл не того размера обязан сбрасывать кеш резолвера")
+    }
+
+    func testImageArrivingWithWrongSizeIsTreatedAsCorruptedTransport() throws {
+        let config = makeConfig()
+        let fetcher = FakeFetcher()
+        fetcher.manifestResult = .success(.image(pngSize: 3, seq: 1))
+        fetcher.blobResults[0] = .success(Data([1, 2, 3, 4, 5])) // 5 байт вместо заявленных 3
+        let writer = FakeClipboard()
+        let (client, _) = makeClient(config: config, prober: FakeProber(), fetcher: fetcher, writer: writer)
+
+        XCTAssertThrowsError(try client.pull()) { error in
+            guard case .transport = error as? PullError else {
+                return XCTFail("ожидали .transport, получили \(error)")
+            }
+        }
+        XCTAssertTrue(writer.written.isEmpty)
+    }
+
+    // MARK: - Ревью раунда 2: отказ уборки не должен превращать успех в ошибку
+
+    func testSuccessfulPullSucceedsEvenWhenStagingCleanupFails() throws {
+        // Уборка — housekeeping вокруг уже состоявшегося успеха. Ломаем cleanup()
+        // по-настоящему, без фейков: подсовываем staging.root, который существует, но
+        // является обычным файлом, а не папкой — `contentsOfDirectory(at:)` бросит
+        // реальную ошибку файловой системы.
+        let brokenRoot = stagingRoot.appendingPathComponent("not-a-directory")
+        try Data("я файл, а не папка".utf8).write(to: brokenRoot)
+        let staging = Staging(root: brokenRoot)
+
+        let config = makeConfig()
+        let fetcher = FakeFetcher()
+        fetcher.manifestResult = .success(.text("успех несмотря на грязную уборку", seq: 1))
+        let writer = FakeClipboard()
+        let resolver = PeerResolver(config: config, prober: FakeProber())
+        let client = PullClient(config: config, resolver: resolver, fetcher: fetcher, staging: staging, writer: writer)
+
+        let result = try client.pull()
+
+        XCTAssertEqual(result.kind, .text)
+        XCTAssertEqual(writer.content, .text("успех несмотря на грязную уборку"))
     }
 
     // MARK: - staging.cleanup() вызывается только на успехе

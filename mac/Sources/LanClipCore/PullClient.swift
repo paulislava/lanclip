@@ -49,15 +49,22 @@ public final class PullClient {
         }
 
         // Ruling задачи 3/11: `Manifest.decode` не проверяет межполевые инварианты —
-        // манифест `{"kind":"image","seq":1}` без `blobs` декодируется успешно. Мы —
-        // первая точка в проекте, где манифест приходит из сети, поэтому именно здесь
-        // отлавливается сорванная передача, прежде чем её примут за пустой буфер.
-        // По духу это тот же случай, что и 409 при скачивании блоба (то, что мы
-        // получили, не соответствует тому, что было обещано, потому что состояние
-        // соседа изменилось) — сосед жив, поэтому кеш резолвера не сбрасывается.
-        try validateManifestIntegrity(manifest)
+        // манифест `{"kind":"image","seq":1}` без `blobs`, либо с `totalSize`,
+        // расходящимся с суммой по `blobs`, декодируется успешно. Мы — первая точка в
+        // проекте, где манифест приходит из сети, поэтому именно здесь отлавливается
+        // самопротиворечивый манифест — это НЕ то же самое, что 409 при скачивании
+        // блоба: там сосед в порядке, просто его буфер уехал между двумя запросами
+        // (повтор почти наверняка сработает, кеш резолвера не трогаем). Самопротиворечивый
+        // манифест — это дефект кодировщика на той стороне либо подделка: повтор тому же
+        // соседу воспроизведёт то же самое, поэтому кеш сбрасывается наравне с прочими
+        // ошибками транспорта, и `peers` получает шанс выбрать другого соседа.
+        //
+        // Заодно здесь же считается настоящий `totalSize` — сумма по `blobs`, а не
+        // присланное соседом число: `maxBytes` обязан ловить и того, кто занизил размер
+        // в манифесте, а прислал больше данных по факту (см. проверку размера каждого
+        // скачанного блоба ниже).
+        let totalSize = try validateManifestIntegrity(manifest)
 
-        let totalSize = manifest.totalSize ?? 0
         guard totalSize <= config.maxBytes else {
             throw PullError.tooLarge(totalSize: totalSize, maxBytes: config.maxBytes)
         }
@@ -65,7 +72,11 @@ public final class PullClient {
         let outcome = try download(manifest: manifest, host: host)
 
         try writer.write(outcome.content)
-        try staging.cleanup()
+        // Уборка — housekeeping вокруг уже состоявшегося успеха: её отказ не должен
+        // превращать успешную вставку в ошибку `pull()` (тем же принципом сам
+        // `Staging.cleanup()` уже терпим к отказу удаления отдельной партии — см. его
+        // `try?` внутри цикла удаления).
+        try? staging.cleanup()
 
         return PullResult(kind: manifest.kind, fileCount: outcome.fileCount, bytes: outcome.bytes)
     }
@@ -81,15 +92,41 @@ public final class PullClient {
         }
     }
 
-    private func validateManifestIntegrity(_ manifest: Manifest) throws {
+    /// Проверяет межполевые инварианты, которые `Manifest.decode` не проверяет сам, и
+    /// возвращает настоящий `totalSize` — сумму по `blobs`, посчитанную нами, а не
+    /// присланное соседом число (иначе сосед мог бы объявить `totalSize: 1` и приложить
+    /// блобы суммарно на гигабайты — лимит `maxBytes` тогда не работал бы вовсе).
+    private func validateManifestIntegrity(_ manifest: Manifest) throws -> Int {
         switch manifest.kind {
         case .text:
-            guard manifest.text != nil else { throw PullError.changedMidTransfer }
+            guard manifest.text != nil else {
+                throw corruptedManifestError("kind=text без text")
+            }
+            return 0
+
         case .image, .files:
-            guard let blobs = manifest.blobs, !blobs.isEmpty else { throw PullError.changedMidTransfer }
+            guard let blobs = manifest.blobs, !blobs.isEmpty else {
+                throw corruptedManifestError("kind=\(manifest.kind.rawValue) без blobs")
+            }
+            let computedTotal = blobs.reduce(0) { $0 + $1.size }
+            if let declaredTotal = manifest.totalSize, declaredTotal != computedTotal {
+                throw corruptedManifestError(
+                    "totalSize=\(declaredTotal) в манифесте расходится с суммой по blobs=\(computedTotal)")
+            }
+            return computedTotal
+
         case .empty:
-            break // отсечено раньше в pull()
+            return 0 // отсечено раньше в pull()
         }
+    }
+
+    /// Самопротиворечивый манифест или блоб, пришедший не того размера, что был
+    /// обещан, — не гонка с соседским буфером (та ловится через 409), а дефект/подделка
+    /// на стороне отправителя. Кеш резолвера сбрасывается наравне с прочими ошибками
+    /// транспорта — см. комментарий в `pull()`.
+    private func corruptedManifestError(_ detail: String) -> PullError {
+        resolver.invalidate()
+        return .transport("манифест соседа испорчен: \(detail)")
     }
 
     // MARK: - Загрузка содержимого
@@ -120,11 +157,20 @@ public final class PullClient {
     }
 
     private func downloadImage(manifest: Manifest, host: String) throws -> DownloadOutcome {
+        // Проверено в validateManifestIntegrity(_:): blobs не nil и не пуст.
+        let blob = (manifest.blobs ?? [])[0]
+
         do {
             guard let data = try fetcher.blob(host: host, port: config.port, token: config.token,
-                                               index: 0, seq: manifest.seq, to: nil) else {
-                resolver.invalidate()
-                throw PullError.transport("сервер не вернул тело блоба изображения")
+                                               index: blob.i, seq: manifest.seq, to: nil) else {
+                throw corruptedManifestError("сервер не вернул тело блоба изображения")
+            }
+            // Соседу мало объявить малый totalSize — реальный размер каждого блоба
+            // сверяется отдельно, иначе лимит maxBytes ловил бы только то, что сосед
+            // сам про себя сказал, а не то, что реально пришло.
+            guard data.count == blob.size else {
+                throw corruptedManifestError(
+                    "блоб изображения пришёл размером \(data.count) байт, манифест обещал \(blob.size)")
             }
             return DownloadOutcome(content: .image(data), fileCount: 0, bytes: data.count)
         } catch let error as HttpClientError {
@@ -147,11 +193,23 @@ public final class PullClient {
             } catch let error as HttpClientError {
                 throw mapBlobFetchError(error)
             }
+
+            let actualSize = try fileSize(at: destination)
+            guard actualSize == blob.size else {
+                throw corruptedManifestError(
+                    "файл \(blob.rel) пришёл размером \(actualSize) байт, манифест обещал \(blob.size)")
+            }
+
             urls.append(destination)
-            totalBytes += blob.size
+            totalBytes += actualSize
         }
 
         return DownloadOutcome(content: .files(urls), fileCount: urls.count, bytes: totalBytes)
+    }
+
+    private func fileSize(at url: URL) throws -> Int {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        return (attributes[.size] as? NSNumber)?.intValue ?? 0
     }
 
     /// `409` сигналит, что содержимое соседа сменилось между манифестом и скачиванием
