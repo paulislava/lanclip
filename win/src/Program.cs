@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace LanClip
@@ -102,15 +103,16 @@ namespace LanClip
             Staging staging = new Staging(Staging.DefaultRoot(), delegate { return DateTime.Now; });
             PullClient pullClient = new PullClient(config, resolver, fetcher, staging, clipboard);
 
-            // pullClient.Pull() дёргается минимум из одного места здесь (обработчик
-            // POST /pull) и из ещё одного, добавленного в задаче 24 (обработчик
-            // хоткея) — ни Staging, ни WinClipboard внутри Pull() сами по себе не
-            // синхронизированы: сосед может дёрнуть /pull ровно в момент, когда
-            // пользователь жмёт хоткей, и два одновременных Pull() создали бы две
-            // перемешанные партии стейджинга и гонку записи в буфер. pullLock —
-            // общий турникет для ЛЮБОГО вызова Pull(), откуда бы он ни пришёл:
-            // второй вызов не отклоняется и не падает с "занято", а просто ждёт
-            // своей очереди — зеркало серийной DispatchQueue на Mac-стороне.
+            // pullClient.Pull() дёргается из двух независимых мест: обработчик
+            // POST /pull ниже и обработчик хоткея дальше по функции — ни Staging,
+            // ни WinClipboard внутри Pull() сами по себе не синхронизированы: сосед
+            // может дёрнуть /pull ровно в момент, когда пользователь жмёт хоткей, и
+            // два одновременных Pull() создали бы две перемешанные партии стейджинга
+            // и гонку записи в буфер. pullLock — общий турникет для ЛЮБОГО вызова
+            // Pull(), откуда бы он ни пришёл: второй вызов не отклоняется и не падает
+            // с "занято", а просто ждёт своей очереди (оба вызывающих и так терпимы к
+            // небольшой задержке — сеть, пауза синтеза) — зеркало серийной
+            // DispatchQueue на Mac-стороне.
             object pullLock = new object();
 
             HttpServer server = new HttpServer(config, snapshots, hostName, delegate
@@ -143,12 +145,64 @@ namespace LanClip
                 return 1;
             }
 
-            Console.WriteLine("lanclip слушает порт " + server.BoundPort + " (хост " + hostName + ")");
+            // Ctrl+Shift+V: Pull() ходит в сеть и может занять секунды, поэтому
+            // выполняется на фоновом потоке пула — обработчик хоткея сам приходит на
+            // главный поток (тот, на котором крутится цикл сообщений Windows вместе с
+            // TrayNotifier), и блокировка этого потока сетевым вызовом заморозила бы
+            // и хоткей, и трей на время всего Pull(). pullLock — тот же самый
+            // турникет, что и у обработчика POST /pull выше: если сеть в этот момент
+            // уже тянет pull для соседа, хоткей просто встаёт следом в очередь, а не
+            // гонится с ним за один и тот же Staging/буфер. Синтез вставки, наоборот,
+            // идёт только после того, как Pull() уже вернулся и буфер наполнен.
+            Hotkey hotkey = new Hotkey(delegate
+            {
+                ThreadPool.QueueUserWorkItem(delegate
+                {
+                    try
+                    {
+                        PullResult result;
+                        lock (pullLock)
+                        {
+                            result = pullClient.Pull();
+                        }
 
-            // Цикл сообщений Windows: нужен, чтобы у TrayNotifier (NotifyIcon) была
-            // возможность доставлять события показа балунов. Глобальный хоткей
-            // Ctrl+Shift+V регистрируется здесь в задаче 24 — до неё serve уже
-            // работает и обслуживает HTTP, просто без хоткея.
+                        if (config.AutoPaste)
+                        {
+                            Paste.Send();
+                        }
+
+                        // Успех тихий — кроме файлов, где полезно знать, что именно
+                        // приехало и сколько весит, до того как открывать проводник.
+                        if (result.Kind == "files")
+                        {
+                            notifier.Info(PluralizedFiles(result.FileCount) + ", " + MegabytesString(result.Bytes));
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        notifier.Error(DescribePullFailure(e));
+                    }
+                });
+            });
+
+            try
+            {
+                hotkey.Register();
+            }
+            catch (Exception e)
+            {
+                Console.Error.WriteLine("Не удалось зарегистрировать глобальный хоткей Ctrl+Shift+V: " + Describe(e));
+                return 1;
+            }
+
+            Console.WriteLine("lanclip слушает порт " + server.BoundPort + " (хост " + hostName
+                + "), хоткей Ctrl+Shift+V активен");
+
+            // Application.Run() без аргументов: главный поток крутит цикл сообщений
+            // Windows бесконечно (аналог RunLoop.current.run() на Mac) — именно он
+            // доставляет WM_HOTKEY скрытому окну Hotkey и события NotifyIcon у
+            // TrayNotifier. Сам цикл ничем не блокируется: сетевой Pull() и синтез
+            // вставки уходят на ThreadPool выше, а не выполняются здесь.
             Application.Run();
             return 0;
         }
@@ -370,6 +424,50 @@ namespace LanClip
                 default:
                     return "Непредвиденная ошибка Pull(): " + Describe(pullError);
             }
+        }
+
+        // MARK: - Тост про файлы после хоткея
+
+        // Русское склонение «файл/файла/файлов» по числу — используется только в
+        // тосте после хоткея, больше нигде в проекте текст не согласуется с числом.
+        static string PluralizedFiles(int count)
+        {
+            int mod100 = count % 100;
+            int mod10 = count % 10;
+
+            string word;
+            if (mod100 >= 11 && mod100 <= 14)
+            {
+                word = "файлов";
+            }
+            else if (mod10 == 1)
+            {
+                word = "файл";
+            }
+            else if (mod10 >= 2 && mod10 <= 4)
+            {
+                word = "файла";
+            }
+            else
+            {
+                word = "файлов";
+            }
+
+            return count + " " + word;
+        }
+
+        // Округлённый размер в мегабайтах (десятичных, x1_000_000 — как подписи
+        // размера файлов в Проводнике). Ненулевой размер, округлившийся к 0 МБ,
+        // показывается как 1 МБ — иначе тост про реально скачанные файлы выглядел
+        // бы как "0 МБ", что похоже на баг.
+        static string MegabytesString(long bytes)
+        {
+            if (bytes <= 0)
+            {
+                return "0 МБ";
+            }
+            long megabytes = (long)Math.Max(1, Math.Round(bytes / 1000000.0));
+            return megabytes + " МБ";
         }
 
         // MARK: - Мелкие утилиты вывода
