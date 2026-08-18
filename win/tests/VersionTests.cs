@@ -23,6 +23,7 @@ namespace LanClip.Tests
             ConfigTests.Register();
             SnapshotTests.Register();
             StaExecutorTests.Register();
+            HttpServerTests.Register();
             return T.Summary();
         }
     }
