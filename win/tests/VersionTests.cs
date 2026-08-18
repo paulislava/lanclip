@@ -29,6 +29,7 @@ namespace LanClip.Tests
             StagingTests.Register();
             PeerResolverTests.Register();
             PullClientTests.Register();
+            NotifierTests.Register();
             WinClipboardTests.Register();
             return T.Summary();
         }
