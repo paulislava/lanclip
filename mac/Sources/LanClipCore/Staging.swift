@@ -9,23 +9,39 @@ public struct StagingBatch {
     /// Строит путь назначения для относительного пути `rel`, приехавшего с чужой
     /// машины, и создаёт промежуточные папки. `rel` — недоверенный ввод: сначала
     /// прогоняется через `RelPath.normalize`, а затем — ещё раз, уже как последний
-    /// рубеж перед записью на диск — проверяется, что итоговый нормализованный путь
-    /// лежит внутри `root`. Одной нормализации мало: она гарантирует форму строки,
-    /// а не то, что финальный URL не выпрыгнул за пределы партии.
+    /// рубеж перед записью на диск — проверяется, что итоговый путь лежит внутри
+    /// `root`. Одной нормализации мало: она гарантирует форму строки, а не то, что
+    /// финальный URL не выпрыгнул за пределы партии.
+    ///
+    /// Эта последняя проверка обязана быть symlink-aware, а не просто лексической:
+    /// `standardized`/`standardizedFileURL` схлопывает только `.`/`..` в строке и не
+    /// разрешает символические ссылки. Если внутри партии окажется каталог-симлинк
+    /// (например, `root/sub` в реальности указывает на `/etc`), кандидат
+    /// `root/sub/passwd` текстуально лежит внутри `root` и прошёл бы лексическую
+    /// проверку, но `createDirectory`/запись на диск ушли бы по ссылке наружу.
+    /// Поэтому сравнение ведётся по `resolvingSymlinksInPath()` — но разрешать можно
+    /// только то, что уже существует на диске, а сам файл ещё не создан, поэтому
+    /// разрешается каталог, в котором файл будет лежать, и порядок важен: сначала
+    /// создать промежуточные каталоги, потом разрешить и проверить. Если после этого
+    /// разрешённый путь оказался за пределами `root` — отказ; уже созданные каталоги
+    /// специально не откатываются: партия целиком временная и уборка (`cleanup()`)
+    /// сама уберёт её позже.
     public func destination(for rel: String) throws -> URL {
         guard let normalized = RelPath.normalize(rel) else {
             throw StagingError.unsafeRelativePath(rel)
         }
 
         let candidate = root.appendingPathComponent(normalized)
-        let rootPath = root.standardizedFileURL.path
-        let candidatePath = candidate.standardizedFileURL.path
-        guard candidatePath == rootPath || candidatePath.hasPrefix(rootPath + "/") else {
+        let candidateDirectory = candidate.deletingLastPathComponent()
+
+        try FileManager.default.createDirectory(at: candidateDirectory, withIntermediateDirectories: true)
+
+        let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL.path
+        let resolvedDirectory = candidateDirectory.resolvingSymlinksInPath().standardizedFileURL.path
+        guard resolvedDirectory == resolvedRoot || resolvedDirectory.hasPrefix(resolvedRoot + "/") else {
             throw StagingError.unsafeRelativePath(rel)
         }
 
-        try FileManager.default.createDirectory(at: candidate.deletingLastPathComponent(),
-                                                  withIntermediateDirectories: true)
         return candidate
     }
 }

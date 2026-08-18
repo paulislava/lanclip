@@ -105,6 +105,42 @@ final class StagingTests: XCTestCase {
         XCTAssertTrue(destination.standardized.path.hasPrefix(batch.root.standardized.path))
     }
 
+    /// Лексическая проверка (`standardizedFileURL`) не разрешает символические ссылки:
+    /// если внутри партии есть каталог-симлинк, ведущий наружу, кандидат текстуально
+    /// лежит внутри `root`, но на диске запись ушла бы за его пределы. Проверка обязана
+    /// быть symlink-aware — сравнивать нужно уже разрешённые пути.
+    func testDestinationRejectsPathThroughSymlinkEscapingRoot() throws {
+        let outside = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("lanclip-staging-outside-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outside) }
+
+        let staging = Staging(root: root, now: { self.fixedDate() })
+        let batch = try staging.newBatch()
+
+        let symlink = batch.root.appendingPathComponent("sub")
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: outside)
+
+        XCTAssertThrowsError(try batch.destination(for: "sub/passwd")) { error in
+            XCTAssertEqual(error as? StagingError, .unsafeRelativePath("sub/passwd"))
+        }
+    }
+
+    /// Контроль к предыдущему тесту: починка не должна запрещать обычные вложенные
+    /// пути без симлинков — только те, что реально выходят за пределы партии.
+    func testDestinationStillSucceedsForNestedPathWithoutSymlinks() throws {
+        let staging = Staging(root: root, now: { self.fixedDate() })
+        let batch = try staging.newBatch()
+
+        let destination = try batch.destination(for: "sub/nested/file.txt")
+
+        XCTAssertEqual(destination.path, batch.root.appendingPathComponent("sub/nested/file.txt").path)
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: destination.deletingLastPathComponent().path,
+                                                       isDirectory: &isDirectory))
+        XCTAssertTrue(isDirectory.boolValue)
+    }
+
     // MARK: - cleanup()
 
     func testCleanupRemovesBatchesOlderThanSevenDays() throws {
