@@ -132,6 +132,67 @@ final class MacPasteboardTests: XCTestCase {
         XCTAssertEqual(try sut.read(), .empty)
     }
 
+    // MARK: - I3: отказ записи (потеря владения буфером) обязан бросать, не проглатываться
+
+    /// `RawPasteboard`, детерминированно отказывающий во всех write-методах — имитирует
+    /// задокументированное поведение `NSPasteboard`, когда другой процесс успел
+    /// вклиниться `clearContents()` между нашим `clearContents()` и записью, и вызывающая
+    /// сторона потеряла владение буфером. `readObjects`/`data`/`string` не нужны этим
+    /// тестам (проверяется только путь `write()`), поэтому возвращают nil/пусто.
+    private final class FailingRawPasteboard: RawPasteboard {
+        private(set) var clearCount = 0
+        var changeCount: Int = 0
+
+        func clearContents() -> Int {
+            clearCount += 1
+            return changeCount
+        }
+
+        func data(forType dataType: NSPasteboard.PasteboardType) -> Data? { nil }
+        func string(forType dataType: NSPasteboard.PasteboardType) -> String? { nil }
+        func readObjects(forClasses classArray: [AnyClass],
+                          options: [NSPasteboard.ReadingOptionKey: Any]?) -> [Any]? { nil }
+
+        func setString(_ string: String, forType dataType: NSPasteboard.PasteboardType) -> Bool { false }
+        func setData(_ data: Data?, forType dataType: NSPasteboard.PasteboardType) -> Bool { false }
+        func writeObjects(_ objects: [NSPasteboardWriting]) -> Bool { false }
+        func setPropertyList(_ propertyList: Any, forType dataType: NSPasteboard.PasteboardType) -> Bool { false }
+    }
+
+    func testWriteTextThrowsWhenPasteboardRejectsTheWrite() {
+        let failing = FailingRawPasteboard()
+        let sut = MacPasteboard(pasteboard: failing)
+
+        XCTAssertThrowsError(try sut.write(.text("привет"))) { error in
+            guard case .writeFailed = error as? MacPasteboardError else {
+                return XCTFail("ожидался .writeFailed, получено \(error)")
+            }
+        }
+        XCTAssertEqual(failing.clearCount, 1, "clearContents() всё равно вызывается один раз до попытки записи")
+    }
+
+    func testWriteImageThrowsWhenPasteboardRejectsTheWrite() {
+        let failing = FailingRawPasteboard()
+        let sut = MacPasteboard(pasteboard: failing)
+
+        XCTAssertThrowsError(try sut.write(.image(Data([1, 2, 3])))) { error in
+            guard case .writeFailed = error as? MacPasteboardError else {
+                return XCTFail("ожидался .writeFailed, получено \(error)")
+            }
+        }
+    }
+
+    func testWriteFilesThrowsWhenWriteObjectsRejectsTheWrite() {
+        let failing = FailingRawPasteboard()
+        let sut = MacPasteboard(pasteboard: failing)
+
+        XCTAssertThrowsError(try sut.write(.files([URL(fileURLWithPath: "/tmp/a.txt")]))) { error in
+            guard case .writeFailed = error as? MacPasteboardError else {
+                return XCTFail("ожидался .writeFailed, получено \(error)")
+            }
+        }
+    }
+
     // MARK: - Помощники
 
     private enum TestError: Error { case encodingFailed }

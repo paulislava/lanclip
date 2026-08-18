@@ -1,12 +1,43 @@
 import AppKit
 import Foundation
 
-/// Ошибки, специфичные для настоящего системного буфера macOS. Единственный
-/// случай, где чтение может не свестись к одному из вариантов `ClipContent`, —
-/// буфер содержит TIFF, который не удаётся перекодировать в PNG.
+/// Ошибки, специфичные для настоящего системного буфера macOS.
 public enum MacPasteboardError: Error, Equatable {
+    /// Буфер содержит TIFF, который не удаётся перекодировать в PNG.
     case tiffConversionFailed
+    /// Находка I3 финального ревью: `setString`/`setData`/`writeObjects`/
+    /// `setPropertyList` возвращают `Bool` и все четыре результата раньше были
+    /// отброшены. `NSPasteboard` документированно возвращает `false`, если вызывающая
+    /// сторона потеряла владение буфером между `clearContents()` и записью (другой
+    /// процесс успел вклиниться и тоже вызвать `clearContents()`) — до этой правки
+    /// такой отказ никак не всплывал: `write()` рапортовал успех, `pull()` показывал
+    /// тост об успехе, а буфер оставался пустым, причём прежнее содержимое уже было
+    /// уничтожено первым `clearContents()`.
+    case writeFailed(String)
 }
+
+/// Минимальный протокол-обёртка над теми методами `NSPasteboard`, которые
+/// использует `MacPasteboard` — тестовый шов: `NSPasteboard` не подсаживается на
+/// шпион напрямую (нет доступного `init`, экземпляры только через фабричные
+/// методы вроде `.general`), но тест может подставить сюда `FakeRawPasteboard`,
+/// у которого `setString`/`setData`/`writeObjects`/`setPropertyList` детерминированно
+/// возвращают `false`, чтобы проверить, что `write()` действительно бросает, а не
+/// проглатывает отказ. `NSPasteboard` уже реализует все эти методы с точно такими
+/// же сигнатурами, поэтому `extension NSPasteboard: RawPasteboard {}` ниже не
+/// требует ни одной новой строчки кода.
+public protocol RawPasteboard: AnyObject {
+    var changeCount: Int { get }
+    func clearContents() -> Int
+    func data(forType dataType: NSPasteboard.PasteboardType) -> Data?
+    func string(forType dataType: NSPasteboard.PasteboardType) -> String?
+    func readObjects(forClasses classArray: [AnyClass], options: [NSPasteboard.ReadingOptionKey: Any]?) -> [Any]?
+    func setString(_ string: String, forType dataType: NSPasteboard.PasteboardType) -> Bool
+    func setData(_ data: Data?, forType dataType: NSPasteboard.PasteboardType) -> Bool
+    func writeObjects(_ objects: [NSPasteboardWriting]) -> Bool
+    func setPropertyList(_ propertyList: Any, forType dataType: NSPasteboard.PasteboardType) -> Bool
+}
+
+extension NSPasteboard: RawPasteboard {}
 
 /// `ClipboardReading`/`ClipboardWriting` поверх настоящего `NSPasteboard`.
 ///
@@ -20,9 +51,9 @@ public final class MacPasteboard: ClipboardReading, ClipboardWriting {
     /// ожидают увидеть список путей файлов на буфере.
     private static let filenamesType = NSPasteboard.PasteboardType("NSFilenamesPboardType")
 
-    private let pasteboard: NSPasteboard
+    private let pasteboard: RawPasteboard
 
-    public init(pasteboard: NSPasteboard = .general) {
+    public init(pasteboard: RawPasteboard = NSPasteboard.general) {
         self.pasteboard = pasteboard
     }
 
@@ -60,24 +91,32 @@ public final class MacPasteboard: ClipboardReading, ClipboardWriting {
     }
 
     public func write(_ content: ClipContent) throws {
-        pasteboard.clearContents()
+        _ = pasteboard.clearContents()
 
         switch content {
         case .empty:
             break
 
         case .text(let value):
-            pasteboard.setString(value, forType: .string)
+            guard pasteboard.setString(value, forType: .string) else {
+                throw MacPasteboardError.writeFailed("setString(forType: .string)")
+            }
 
         case .image(let png):
-            pasteboard.setData(png, forType: .png)
+            guard pasteboard.setData(png, forType: .png) else {
+                throw MacPasteboardError.writeFailed("setData(forType: .png)")
+            }
 
         case .files(let urls):
             // Современные приложения читают NSURL-объекты…
-            pasteboard.writeObjects(urls as [NSURL])
+            guard pasteboard.writeObjects(urls as [NSURL]) else {
+                throw MacPasteboardError.writeFailed("writeObjects(_:)")
+            }
             // …а старые (без поддержки NSURL на буфере) — легаси-список путей.
             let paths = urls.map { $0.path }
-            pasteboard.setPropertyList(paths, forType: Self.filenamesType)
+            guard pasteboard.setPropertyList(paths, forType: Self.filenamesType) else {
+                throw MacPasteboardError.writeFailed("setPropertyList(forType: NSFilenamesPboardType)")
+            }
         }
     }
 }
