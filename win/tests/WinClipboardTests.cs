@@ -17,10 +17,19 @@ namespace LanClip.Tests
     // тестов внутри упал (T.Run сам не даёт исключению вылететь наружу, но мы всё
     // равно не полагаемся на это и держим finally на верхнем уровне).
     //
-    // Если исходное содержимое буфера не удалось ни прочитать, ни потом записать
-    // обратно (экзотический формат, которого нет ни в одном из четырёх случаев
-    // ClipContent) — буфер просто очищается, а не оставляется с тестовым мусором.
-    // Итог восстановления печатается в консоль явно, чтобы это было видно в выводе
+    // Снимок и восстановление идут через сырой Clipboard.GetDataObject()/SetDataObject(),
+    // а не через WinClipboard.Read()/Write(). ClipContent знает только четыре случая
+    // (пусто/текст/PNG/файлы) — если исходное содержимое буфера было богаче этого
+    // (несколько форматов сразу: RTF+текст, HTML+текст, картинка с форматами помимо
+    // Bitmap, формат конкретного приложения), Read() схлопнул бы его до одного
+    // совпавшего вида, а последующий Write(original) переписал бы буфер этой
+    // урезанной версией — то есть каждый прогон тестов тихо терял бы часть
+    // содержимого буфера Павла. Сырой IDataObject копирует все присутствующие
+    // форматы как есть, без прохода через ClipContent.
+    //
+    // Если исходное содержимое всё же не удалось ни снять, ни потом восстановить —
+    // буфер просто очищается, а не оставляется с тестовым мусором. Итог
+    // восстановления печатается в консоль явно, чтобы это было видно в выводе
     // прогона, а не тонуло молча.
     static class WinClipboardTests
     {
@@ -29,16 +38,16 @@ namespace LanClip.Tests
             StaExecutor sta = new StaExecutor();
             WinClipboard sut = new WinClipboard(sta);
 
-            ClipContent original = null;
+            DataObject backup = null;
             bool captured = false;
             try
             {
-                original = sut.Read();
+                sta.Invoke(new Action(delegate { backup = CaptureRawClipboard(); }));
                 captured = true;
             }
             catch (Exception e)
             {
-                Console.WriteLine("WinClipboardTests: не удалось прочитать исходный буфер перед тестами: "
+                Console.WriteLine("WinClipboardTests: не удалось снять снимок исходного буфера перед тестами: "
                     + e.GetType().Name + ": " + e.Message);
             }
 
@@ -48,20 +57,83 @@ namespace LanClip.Tests
             }
             finally
             {
-                RestoreOriginal(sta, sut, captured, original);
+                RestoreOriginal(sta, captured, backup);
                 sta.Shutdown();
             }
         }
 
-        static void RestoreOriginal(StaExecutor sta, WinClipboard sut, bool captured, ClipContent original)
+        // Вызывается уже на STA-потоке (изнутри sta.Invoke в Register()).
+        //
+        // GetFormats(false) — только форматы, реально присутствующие на буфере, без
+        // автоматически достраиваемых конвертируемых вариантов (иначе восстановление
+        // положило бы на буфер форматы, которых там не было). GetData(format, false) —
+        // тот же принцип для самих байт: без автоконвертации, то есть без
+        // перекодирования на пути "снять/положить обратно".
+        //
+        // Важно запрашивать содержимое каждого формата немедленно, а не откладывать:
+        // IDataObject, который вернул Clipboard.GetDataObject(), может отдавать данные
+        // отложенным рендерингом от исходного приложения. Если сам буфер сменится
+        // (а тесты его меняют) до того, как мы прочли байты, повторный запрос к тому
+        // же IDataObject может вернуть уже пусто. Поэтому копируем данные каждого
+        // формата в новый DataObject сразу здесь, а не храним ссылку на исходный
+        // IDataObject для использования позже.
+        static DataObject CaptureRawClipboard()
+        {
+            IDataObject current = Clipboard.GetDataObject();
+            if (current == null)
+            {
+                return null;
+            }
+
+            string[] formats = current.GetFormats(false);
+            DataObject snapshot = new DataObject();
+            bool any = false;
+
+            foreach (string format in formats)
+            {
+                try
+                {
+                    object data = current.GetData(format, false);
+                    if (data != null)
+                    {
+                        snapshot.SetData(format, false, data);
+                        any = true;
+                    }
+                }
+                catch (Exception)
+                {
+                    // Формат объявлен, но не читается (например, приложение-источник
+                    // уже закрылось и не дорендерило отложенный формат) — пропускаем
+                    // именно этот формат, а не весь снимок.
+                }
+            }
+
+            return any ? snapshot : null;
+        }
+
+        static void RestoreOriginal(StaExecutor sta, bool captured, DataObject backup)
         {
             if (captured)
             {
                 try
                 {
-                    sut.Write(original);
+                    sta.Invoke(new Action(delegate
+                    {
+                        if (backup == null)
+                        {
+                            Clipboard.Clear();
+                        }
+                        else
+                        {
+                            // persist:true — рендерит все формы немедленно в системный
+                            // буфер обмена, а не откладывает до выхода процесса: процесс
+                            // тестов (особенно запущенный разовой задачей планировщика)
+                            // вот-вот завершится сам.
+                            Clipboard.SetDataObject(backup, true);
+                        }
+                    }));
                     Console.WriteLine("WinClipboardTests: исходное содержимое буфера восстановлено (" +
-                        original.Kind + ")");
+                        (backup == null ? "буфер был пуст" : string.Join(", ", backup.GetFormats(false))) + ")");
                     return;
                 }
                 catch (Exception e)
@@ -72,8 +144,8 @@ namespace LanClip.Tests
             }
             else
             {
-                Console.WriteLine("WinClipboardTests: исходное содержимое буфера не было прочитано " +
-                    "(экзотический формат?), буфер будет очищен");
+                Console.WriteLine("WinClipboardTests: исходное содержимое буфера не было снято перед тестами " +
+                    "(ошибка при снятии снимка?), буфер будет очищен");
             }
 
             try
@@ -127,21 +199,47 @@ namespace LanClip.Tests
 
             // MARK: - Картинка (PNG)
 
-            T.Run("write and read png image roundtrips", delegate
+            T.Run("write and read png image roundtrips byte for byte", delegate
             {
-                byte[] png = MakeTestPng();
+                byte[] png = MakeOpaqueTestPng();
                 sut.Write(ClipContent.OfImage(png));
 
                 ClipContent read = sut.Read();
                 T.Eq(ClipKindValue.Image, read.Kind, "kind");
-                T.True(read.Png != null && read.Png.Length > 8, "png bytes present");
                 T.True(HasPngSignature(read.Png), "roundtripped bytes still carry the real PNG signature");
+                T.True(BytesEqual(png, read.Png), "roundtripped bytes are byte-for-byte identical to the source");
 
                 using (MemoryStream stream = new MemoryStream(read.Png))
                 using (Image decoded = Image.FromStream(stream))
                 {
                     T.Eq(2, decoded.Width, "width preserved");
                     T.Eq(2, decoded.Height, "height preserved");
+                }
+            });
+
+            // Clipboard.SetImage()/GetImage() в одиночку теряют альфа-канал (DIB не
+            // хранит прозрачность) — этот тест берёт PNG с реально прозрачными и
+            // полупрозрачными пикселями и проверяет, что байты, вернувшиеся из
+            // буфера, совпадают с исходными один в один, а не просто "похожая
+            // картинка без альфы".
+            T.Run("write and read png image preserves transparency exactly", delegate
+            {
+                byte[] png = MakeTransparentTestPng();
+                sut.Write(ClipContent.OfImage(png));
+
+                ClipContent read = sut.Read();
+                T.Eq(ClipKindValue.Image, read.Kind, "kind");
+                T.True(BytesEqual(png, read.Png),
+                    "a SetImage()-only path would silently strip alpha via DIB conversion");
+
+                using (MemoryStream stream = new MemoryStream(read.Png))
+                using (Bitmap decoded = new Bitmap(stream))
+                {
+                    Color transparentCorner = decoded.GetPixel(0, 0);
+                    T.Eq(0, (int)transparentCorner.A, "fully transparent pixel preserved");
+
+                    Color semiCorner = decoded.GetPixel(1, 1);
+                    T.True(semiCorner.A > 0 && semiCorner.A < 255, "semi-transparent pixel preserved");
                 }
             });
 
@@ -254,14 +352,51 @@ namespace LanClip.Tests
             return true;
         }
 
-        static byte[] MakeTestPng()
+        static bool BytesEqual(byte[] a, byte[] b)
         {
-            using (Bitmap bitmap = new Bitmap(2, 2))
+            if (a == null || b == null)
+            {
+                return a == b;
+            }
+            if (a.Length != b.Length)
+            {
+                return false;
+            }
+            for (int i = 0; i < a.Length; i++)
+            {
+                if (a[i] != b[i])
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        static byte[] MakeOpaqueTestPng()
+        {
+            using (Bitmap bitmap = new Bitmap(2, 2, PixelFormat.Format32bppArgb))
             {
                 bitmap.SetPixel(0, 0, Color.FromArgb(255, 200, 10, 10));
                 bitmap.SetPixel(1, 0, Color.FromArgb(255, 10, 200, 10));
                 bitmap.SetPixel(0, 1, Color.FromArgb(255, 10, 10, 200));
                 bitmap.SetPixel(1, 1, Color.FromArgb(255, 250, 250, 10));
+
+                using (MemoryStream stream = new MemoryStream())
+                {
+                    bitmap.Save(stream, ImageFormat.Png);
+                    return stream.ToArray();
+                }
+            }
+        }
+
+        static byte[] MakeTransparentTestPng()
+        {
+            using (Bitmap bitmap = new Bitmap(2, 2, PixelFormat.Format32bppArgb))
+            {
+                bitmap.SetPixel(0, 0, Color.FromArgb(0, 255, 0, 0));     // полностью прозрачный
+                bitmap.SetPixel(1, 0, Color.FromArgb(255, 0, 255, 0));   // непрозрачный
+                bitmap.SetPixel(0, 1, Color.FromArgb(255, 0, 0, 255));   // непрозрачный
+                bitmap.SetPixel(1, 1, Color.FromArgb(128, 250, 250, 10)); // полупрозрачный
 
                 using (MemoryStream stream = new MemoryStream())
                 {
