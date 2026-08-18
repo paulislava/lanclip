@@ -18,6 +18,8 @@ namespace LanClip.Tests
         static int Main()
         {
             VersionTests.Register();
+            RelPathTests.Register();
+            ManifestTests.Register();
             return T.Summary();
         }
     }
