@@ -20,6 +20,7 @@ namespace LanClip.Tests
             VersionTests.Register();
             RelPathTests.Register();
             ManifestTests.Register();
+            ConfigTests.Register();
             return T.Summary();
         }
     }
