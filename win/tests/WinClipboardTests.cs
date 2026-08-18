@@ -187,6 +187,18 @@ namespace LanClip.Tests
                 T.Eq(ClipKindValue.Empty, sut.Read().Kind, "kind");
             });
 
+            // Находка I4 финального ревью: Clipboard.SetText() бросает ArgumentException
+            // на пустой строке — воспроизводится тривиально через printf '' | pbcopy на
+            // Mac (манифест {"kind":"text","text":""}), и Ctrl+Shift+V на ПК падал
+            // необёрнутым исключением вместо записи пустого буфера.
+            T.Run("writing text-kind content with an empty string does not throw and clears clipboard", delegate
+            {
+                sut.Write(ClipContent.OfText("будет стёрто"));
+                sut.Write(ClipContent.OfText(""));
+                ClipContent read = sut.Read();
+                T.Eq(ClipKindValue.Empty, read.Kind, "empty text clears the clipboard instead of throwing");
+            });
+
             // MARK: - changeCount
 
             T.Run("changeCount increases after write", delegate

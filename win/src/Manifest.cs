@@ -141,7 +141,15 @@ namespace LanClip
                 Manifest m = new Manifest();
                 m.Kind = kind;
                 m.Seq = seq;
-                m.Text = Json.Str(obj, "text", "");
+                // Находка I4 финального ревью: fallback раньше был "" (пустая строка),
+                // из-за чего "ключ text отсутствует" и "text явно пустая строка" были
+                // неразличимы — манифест {"kind":"text","seq":1} без ключа text
+                // молча превращался в пустой текст вместо отказа, а Mac-сторона
+                // (Manifest.text: String?) такой манифест честно отвергает как
+                // испорченный (см. PullClient.ValidateManifestIntegrity: manifest.Text
+                // == null). fallback null восстанавливает симметрию — отсутствие
+                // ключа теперь тоже даёт null, и PullClient уже умеет его отклонять.
+                m.Text = Json.Str(obj, "text", null);
                 return m;
             }
 

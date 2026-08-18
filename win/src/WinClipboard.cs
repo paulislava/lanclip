@@ -145,7 +145,23 @@ namespace LanClip
                         return;
 
                     case ClipKindValue.Text:
-                        Clipboard.SetText(content.Text ?? string.Empty, TextDataFormat.UnicodeText);
+                        // Находка I4 финального ревью: Clipboard.SetText() бросает
+                        // ArgumentException на пустой строке (документированное
+                        // поведение WinForms) — воспроизводится тривиально:
+                        // `printf '' | pbcopy` на Mac даёт манифест
+                        // {"kind":"text","text":""}, и Ctrl+Shift+V на ПК получал
+                        // необёрнутое исключение вместо записи пустого буфера.
+                        // Пустой (или отсутствующий на уровне ClipContent — сюда не
+                        // должно долетать, но на всякий случай тоже трактуется как
+                        // пусто) текст — валидное содержимое буфера, а не ошибка.
+                        if (string.IsNullOrEmpty(content.Text))
+                        {
+                            Clipboard.Clear();
+                        }
+                        else
+                        {
+                            Clipboard.SetText(content.Text, TextDataFormat.UnicodeText);
+                        }
                         return;
 
                     case ClipKindValue.Image:

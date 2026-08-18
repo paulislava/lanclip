@@ -628,13 +628,13 @@ namespace LanClip.Tests
 
             T.Run("manifest with text kind but no text is treated as corrupted transport", delegate
             {
-                // Manifest.FromJson не различает "text отсутствовал" и "text явно
-                // пустая строка" (fallback у Json.Str для text — ""), поэтому этот
-                // случай воспроизводится прямой конструкцией Manifest, а не через JSON —
-                // так проверяется собственная защита PullClient, а не поведение парсера.
-                Manifest manifest = new Manifest();
-                manifest.Kind = "text";
-                manifest.Seq = 1;
+                // Находка I4 финального ревью: Manifest.FromJson теперь различает
+                // "text отсутствовал" (fallback у Json.Str для text — null, было "")
+                // и "text явно пустая строка" — этот случай воспроизводится через
+                // настоящий JSON без ключа text, а не прямой конструкцией Manifest,
+                // проверяя заодно и парсер, а не только защиту PullClient.
+                Manifest manifest = Manifest.FromJson("{\"kind\":\"text\",\"seq\":1}");
+                T.Eq(null, manifest.Text, "premise: text key genuinely absent from JSON, decodes to null");
 
                 Config config = MakeConfig(Config.DefaultMaxBytes);
                 FakeFetcher fetcher = new FakeFetcher();
@@ -646,6 +646,29 @@ namespace LanClip.Tests
                 PullException caught = ExpectThrows(new Action(delegate { client.Pull(); }));
                 T.Eq(PullException.CodeTransport, caught.Code, "code");
                 T.True(writer.Written.Count == 0, "no write");
+            });
+
+            T.Run("manifest with text kind and explicitly empty text pulls successfully and clears clipboard", delegate
+            {
+                // Симметричный контроль: text явно присутствующий, но пустой — валидное
+                // содержимое (printf '' | pbcopy на Mac даёт ровно такой манифест), а не
+                // испорченный манифест. Должен приводить к очистке буфера, а не к отказу.
+                Manifest manifest = Manifest.FromJson("{\"kind\":\"text\",\"seq\":1,\"text\":\"\"}");
+                T.Eq("", manifest.Text, "premise: text key present and explicitly empty, not absent");
+
+                Config config = MakeConfig(Config.DefaultMaxBytes);
+                FakeFetcher fetcher = new FakeFetcher();
+                fetcher.ManifestResult = manifest;
+                FakeClipboard writer = new FakeClipboard();
+                writer.Content = ClipContent.OfText("прежнее содержимое");
+                PeerResolver resolver;
+                PullClient client = MakeClient(config, new FakeProber(true), fetcher, writer, out resolver);
+
+                PullResult result = client.Pull();
+
+                T.Eq("text", result.Kind, "kind");
+                T.Eq(ClipKindValue.Text, writer.Content.Kind, "content kind");
+                T.Eq("", writer.Content.Text, "content is empty text, not the previous value");
             });
 
             T.Run("manifest with files kind but empty blobs is treated as corrupted transport", delegate
