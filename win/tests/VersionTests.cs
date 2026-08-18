@@ -21,6 +21,8 @@ namespace LanClip.Tests
             RelPathTests.Register();
             ManifestTests.Register();
             ConfigTests.Register();
+            SnapshotTests.Register();
+            StaExecutorTests.Register();
             return T.Summary();
         }
     }
