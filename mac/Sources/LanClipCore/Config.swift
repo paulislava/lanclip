@@ -15,7 +15,7 @@ public struct Config: Codable, Equatable, Sendable {
     public var maxBytes: Int
     public var autoPaste: Bool
 
-    public static let defaultPort = 8899
+    public static let defaultPort = 8901
     public static let defaultMaxBytes = 536_870_912
 
     public static var defaultURL: URL {

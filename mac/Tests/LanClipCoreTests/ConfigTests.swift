@@ -32,7 +32,7 @@ final class ConfigTests: XCTestCase {
         let config = try Config.load(at: url)
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
-        XCTAssertEqual(config.port, 8899)
+        XCTAssertEqual(config.port, Config.defaultPort)
         XCTAssertEqual(config.maxBytes, 536_870_912)
         XCTAssertTrue(config.autoPaste)
         XCTAssertEqual(config.token.count, 32)
@@ -45,7 +45,7 @@ final class ConfigTests: XCTestCase {
     func testAppliesDefaultsForMissingKeys() throws {
         let url = try write(#"{"token":"abc","peers":["pc"]}"#)
         let config = try Config.load(at: url)
-        XCTAssertEqual(config.port, 8899)
+        XCTAssertEqual(config.port, Config.defaultPort)
         XCTAssertEqual(config.maxBytes, 536_870_912)
         XCTAssertTrue(config.autoPaste)
         XCTAssertEqual(config.peers, ["pc"])
