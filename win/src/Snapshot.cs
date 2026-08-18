@@ -33,6 +33,42 @@ namespace LanClip
         }
     }
 
+    // Итог SnapshotStore.Blob(index, seq) — находка I6 финального ревью: раньше
+    // метод всегда возвращал byte[], читая файлы блобов "files" целиком в память
+    // (File.ReadAllBytes) внутри Blob(...) независимо от вызывающей стороны.
+    // MaxBytes — проверка на стороне КЛИЕНТА, поэтому GET /clip/blob/{i} можно
+    // послать напрямую, в обход неё; многогигабайтное видео в буфере пользователя
+    // вырубило бы сервер одним таким запросом, ещё до попытки отдать хоть байт.
+    // Data != null для картинки (уже в памяти после чтения буфера), FilePath !=
+    // null для файлов (вызывающая сторона — HttpServer — обязана читать поток с
+    // диска, а не запрашивать готовые байты у SnapshotStore). Ровно одно из двух
+    // полей ненулевое — зеркало Swift-стороннего enum BlobPayload, выраженное тем
+    // же приёмом "нулабельные поля вместо суммы-типа", что и остальной C#-код
+    // проекта (Manifest, ClipContent).
+    class BlobPayload
+    {
+        public readonly byte[] Data;
+        public readonly string FilePath;
+        public readonly long FileSize;
+
+        BlobPayload(byte[] data, string filePath, long fileSize)
+        {
+            Data = data;
+            FilePath = filePath;
+            FileSize = fileSize;
+        }
+
+        public static BlobPayload OfData(byte[] data)
+        {
+            return new BlobPayload(data, null, data.Length);
+        }
+
+        public static BlobPayload OfFile(string path, long size)
+        {
+            return new BlobPayload(null, path, size);
+        }
+    }
+
     class SnapshotStore
     {
         readonly IClipboardReader reader;
@@ -57,7 +93,7 @@ namespace LanClip
         }
 
         // null — индекс вне диапазона (нет такого blob-а в текущем снимке).
-        public byte[] Blob(int index, int seq)
+        public BlobPayload Blob(int index, int seq)
         {
             ClipSnapshot snapshot = Current();
             if (snapshot.Manifest.Seq != seq)
@@ -67,7 +103,7 @@ namespace LanClip
 
             if (snapshot.ImagePng != null)
             {
-                return index == 0 ? snapshot.ImagePng : null;
+                return index == 0 ? BlobPayload.OfData(snapshot.ImagePng) : null;
             }
 
             string source;
@@ -75,7 +111,12 @@ namespace LanClip
             {
                 return null;
             }
-            return File.ReadAllBytes(source);
+            // Размер считается заново с диска (не из манифеста) — это тот же файл,
+            // который HttpServer сейчас откроет и прочитает потоком, поэтому
+            // Content-Length, ушедший в заголовках, гарантированно совпадает с тем,
+            // что реально будет прочитано дальше.
+            long size = new FileInfo(source).Length;
+            return BlobPayload.OfFile(source, size);
         }
 
         static ClipSnapshot Build(int seq, ClipContent content)

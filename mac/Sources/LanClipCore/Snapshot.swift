@@ -4,6 +4,19 @@ public enum SnapshotError: Error, Equatable {
     case staleSeq
 }
 
+/// Итог `SnapshotStore.blob(index:seq:)` — находка I6 финального ревью: раньше
+/// метод всегда возвращал `Data?`, читая файлы блобов `files` целиком в память
+/// (`Data(contentsOf:)`) внутри `blob(...)` независимо от вызывающей стороны.
+/// `maxBytes` — проверка на стороне КЛИЕНТА, поэтому `GET /clip/blob/{i}` можно
+/// послать напрямую, в обход неё; многогигабайтное видео в буфере пользователя
+/// вырубило бы сервер одним таким запросом, ещё до попытки отдать хоть байт.
+/// `.file` заставляет вызывающую сторону (`HttpServer`) читать файл потоком, не
+/// требуя от `SnapshotStore` знать что-либо о сети.
+public enum BlobPayload: Sendable {
+    case data(Data)
+    case file(url: URL, size: Int)
+}
+
 public struct ClipSnapshot: Sendable {
     public let manifest: Manifest
     public let text: String?
@@ -30,15 +43,19 @@ public final class SnapshotStore {
         return snapshot
     }
 
-    public func blob(index: Int, seq: Int) throws -> Data? {
+    public func blob(index: Int, seq: Int) throws -> BlobPayload? {
         let snapshot = try current()
         guard snapshot.manifest.seq == seq else { throw SnapshotError.staleSeq }
 
         if let png = snapshot.imagePNG {
-            return index == 0 ? png : nil
+            return index == 0 ? .data(png) : nil
         }
         guard let source = snapshot.sources[index] else { return nil }
-        return try Data(contentsOf: source)
+        // Размер считается заново с диска (не из манифеста) — это тот же файл,
+        // который сейчас будет прочитан, поэтому `Content-Length`, ушедший в
+        // заголовках, гарантированно совпадает с тем, что реально станет читать
+        // `HttpServer` дальше чанками.
+        return .file(url: source, size: try size(of: source))
     }
 
     private func build(seq: Int, content: ClipContent) throws -> ClipSnapshot {

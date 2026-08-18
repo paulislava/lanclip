@@ -180,6 +180,11 @@ public final class HttpServer: @unchecked Sendable {
     }
 
     private func respond(_ response: HttpResponse, on connection: NWConnection) {
+        if let fileBody = response.fileBody {
+            respondWithFile(response, fileBody: fileBody, on: connection)
+            return
+        }
+
         let head = response.head()
         connection.send(content: head, completion: .contentProcessed { error in
             guard error == nil else {
@@ -203,6 +208,68 @@ public final class HttpServer: @unchecked Sendable {
                 return
             }
             sendBody(body, offset: end, on: connection)
+        })
+    }
+
+    /// Отдаёт `fileBody` чанками прямо с диска (находка I6) — файл никогда не
+    /// оказывается целиком в памяти процесса, независимо от его размера. Файл
+    /// открывается ДО отправки заголовков: если открыть не удалось (файл исчез
+    /// между построением снимка и отдачей — гонка с уборкой стейджинга или
+    /// пользователь удалил исходник), заголовки ещё не ушли и можно честно
+    /// ответить 500 вместо того, чтобы объявить `Content-Length`, а потом оборвать
+    /// соединение на пустом месте.
+    private func respondWithFile(_ response: HttpResponse, fileBody: HttpResponse.FileBody, on connection: NWConnection) {
+        guard let handle = try? FileHandle(forReadingFrom: fileBody.url) else {
+            self.respond(.empty(500), on: connection)
+            return
+        }
+
+        let head = response.head()
+        connection.send(content: head, completion: .contentProcessed { error in
+            guard error == nil else {
+                try? handle.close()
+                connection.cancel()
+                return
+            }
+            HttpServer.sendFileChunk(handle: handle, remaining: fileBody.size, on: connection)
+        })
+    }
+
+    private static func sendFileChunk(handle: FileHandle, remaining: Int, on connection: NWConnection) {
+        guard remaining > 0 else {
+            try? handle.close()
+            connection.cancel()
+            return
+        }
+
+        let toRead = min(remaining, sendChunkSize)
+        let chunk: Data
+        do {
+            chunk = try handle.read(upToCount: toRead) ?? Data()
+        } catch {
+            try? handle.close()
+            connection.cancel()
+            return
+        }
+
+        // Файл на диске оказался короче, чем `Content-Length`, уже объявленный в
+        // заголовках (изменился между построением снимка и отдачей) — обрываем
+        // соединение вместо того, чтобы молча отдать усечённое тело, выдав его за
+        // полное (клиент увидит недописанный ответ и корректно распознает обрыв,
+        // а не тихо примет часть файла за целый).
+        guard !chunk.isEmpty else {
+            try? handle.close()
+            connection.cancel()
+            return
+        }
+
+        connection.send(content: chunk, completion: .contentProcessed { error in
+            guard error == nil else {
+                try? handle.close()
+                connection.cancel()
+                return
+            }
+            sendFileChunk(handle: handle, remaining: remaining - chunk.count, on: connection)
         })
     }
 
@@ -263,8 +330,13 @@ public final class HttpServer: @unchecked Sendable {
         let seq = request.query["seq"].flatMap(Int.init) ?? -1
 
         do {
-            guard let data = try snapshots.blob(index: index, seq: seq) else { return .empty(404) }
-            return .bytes(data)
+            guard let payload = try snapshots.blob(index: index, seq: seq) else { return .empty(404) }
+            switch payload {
+            case .data(let data):
+                return .bytes(data)
+            case .file(let url, let size):
+                return .file(url, size: size)
+            }
         } catch SnapshotError.staleSeq {
             return .empty(409)
         } catch {

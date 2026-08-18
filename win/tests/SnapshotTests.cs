@@ -40,7 +40,9 @@ namespace LanClip.Tests
                 SnapshotStore store = new SnapshotStore(clipboard);
                 ClipSnapshot snapshot = store.Current();
                 T.Eq((long?)png.Length, snapshot.Manifest.TotalSize, "totalSize");
-                T.True(BytesEqual(png, store.Blob(0, snapshot.Manifest.Seq)), "blob bytes");
+                BlobPayload payload = store.Blob(0, snapshot.Manifest.Seq);
+                T.True(payload.FilePath == null, "image blob stays in-memory (.Data), not streamed from disk");
+                T.True(BytesEqual(png, payload.Data), "blob bytes");
             });
 
             T.Run("single file uses bare name", delegate
@@ -59,8 +61,17 @@ namespace LanClip.Tests
 
                     T.Eq(1, snapshot.Manifest.Blobs.Count, "blob count");
                     T.Eq("отчёт.pdf", snapshot.Manifest.Blobs[0].Rel, "rel");
-                    byte[] bytes = store.Blob(0, snapshot.Manifest.Seq);
+                    // Находка I6 финального ревью: файловые блобы обязаны отдаваться как
+                    // .FilePath (читаемые потоком с диска вызывающей стороной), а не как
+                    // готовый byte[] в памяти — многогигабайтный файл в буфере не должен
+                    // попадать в память процесса целиком просто потому, что кто-то
+                    // запросил его блоб.
+                    BlobPayload payload = store.Blob(0, snapshot.Manifest.Seq);
+                    T.True(payload.Data == null, "file blob must be streamed (.FilePath), not loaded into memory");
+                    T.Eq(file, payload.FilePath, "file path");
+                    byte[] bytes = File.ReadAllBytes(payload.FilePath);
                     T.Eq("данные", Encoding.UTF8.GetString(bytes), "content");
+                    T.Eq((long)bytes.Length, payload.FileSize, "reported size matches bytes on disk");
                 }
                 finally
                 {

@@ -18,7 +18,13 @@ namespace LanClip
     {
         public int Status;
         public string ContentType;
+        // Тело, уже целиком лежащее в памяти (JSON, ошибки, картинка — она и так уже
+        // была в памяти после чтения буфера). Взаимоисключающе с FilePath.
         public byte[] Body;
+        // Тело, которое нужно дочитать с диска при отправке (находка I6 финального
+        // ревью) — см. BlobPayload в Snapshot.cs. Взаимоисключающе с Body.
+        public string FilePath;
+        public long FileSize;
 
         public static HttpResponseSpec Empty(int status)
         {
@@ -43,6 +49,17 @@ namespace LanClip
             response.Status = 200;
             response.ContentType = "application/octet-stream";
             response.Body = body;
+            return response;
+        }
+
+        // Блоб, который сервер обязан отдать потоком с диска — см. FilePath выше.
+        public static HttpResponseSpec File(string path, long size)
+        {
+            HttpResponseSpec response = new HttpResponseSpec();
+            response.Status = 200;
+            response.ContentType = "application/octet-stream";
+            response.FilePath = path;
+            response.FileSize = size;
             return response;
         }
     }
@@ -352,6 +369,13 @@ namespace LanClip
                 // во входном потоке и был бы ошибочно принят за начало следующего запроса на
                 // переиспользуемом соединении.
                 httpResponse.KeepAlive = false;
+
+                if (response.FilePath != null)
+                {
+                    WriteFileResponse(httpResponse, response);
+                    return;
+                }
+
                 httpResponse.StatusCode = response.Status;
                 if (response.ContentType != null)
                 {
@@ -372,6 +396,57 @@ namespace LanClip
             finally
             {
                 httpResponse.OutputStream.Close();
+            }
+        }
+
+        // Отдаёт response.FilePath чанками прямо с диска (находка I6) — файл
+        // никогда не оказывается целиком в памяти процесса, независимо от его
+        // размера. Файл открывается ДО того, как в ответ уходит статус/заголовки:
+        // если открыть не удалось (файл исчез между построением снимка и отдачей —
+        // гонка с уборкой стейджинга или пользователь удалил исходник), можно
+        // честно ответить 500 вместо того, чтобы объявить Content-Length, а потом
+        // оборвать поток на пустом месте.
+        static void WriteFileResponse(HttpListenerResponse httpResponse, HttpResponseSpec response)
+        {
+            FileStream input;
+            try
+            {
+                input = new FileStream(response.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            }
+            catch (Exception)
+            {
+                httpResponse.StatusCode = 500;
+                httpResponse.ContentLength64 = 0;
+                return;
+            }
+
+            using (input)
+            {
+                httpResponse.StatusCode = response.Status;
+                if (response.ContentType != null)
+                {
+                    httpResponse.ContentType = response.ContentType;
+                }
+                httpResponse.ContentLength64 = response.FileSize;
+
+                byte[] buffer = new byte[SendChunkSize];
+                long remaining = response.FileSize;
+                while (remaining > 0)
+                {
+                    int toRead = (int)Math.Min(buffer.Length, remaining);
+                    int read = input.Read(buffer, 0, toRead);
+                    if (read <= 0)
+                    {
+                        // Файл на диске оказался короче, чем Content-Length, уже объявленный
+                        // выше (изменился между построением снимка и отдачей) — обрываем
+                        // передачу здесь; клиент увидит меньше байт, чем было обещано, и
+                        // корректно распознает это как оборванный ответ, а не молча примет
+                        // усечённые данные за полные.
+                        return;
+                    }
+                    httpResponse.OutputStream.Write(buffer, 0, read);
+                    remaining -= read;
+                }
             }
         }
 
@@ -468,12 +543,16 @@ namespace LanClip
 
             try
             {
-                byte[] data = snapshots.Blob(index, seq);
-                if (data == null)
+                BlobPayload payload = snapshots.Blob(index, seq);
+                if (payload == null)
                 {
                     return HttpResponseSpec.Empty(404);
                 }
-                return HttpResponseSpec.Bytes(data);
+                if (payload.FilePath != null)
+                {
+                    return HttpResponseSpec.File(payload.FilePath, payload.FileSize);
+                }
+                return HttpResponseSpec.Bytes(payload.Data);
             }
             catch (StaleSeqException)
             {
