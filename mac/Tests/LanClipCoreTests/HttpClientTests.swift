@@ -43,6 +43,20 @@ final class HttpClientTests: XCTestCase {
         XCTAssertFalse(client.probe(host: "127.0.0.1", port: port, token: "wrong", timeout: 3))
     }
 
+    /// Каждый вызов `perform()` открывает своё `NWConnection` — резидентный агент
+    /// делает такие вызовы на каждый хоткей/резолв соседа неделями. Раньше
+    /// `stateUpdateHandler` захватывал `connection` сильно, а `connection` хранил этот
+    /// же handler в своём свойстве — самозамкнутый ARC-цикл, не освобождаемый никогда.
+    /// Этот тест не измеряет память (ненадёжно), а лишь доказывает, что длинная серия
+    /// вызовов остаётся рабочей — при цикле утечки объекты просто накапливались бы
+    /// молча, не давая явного сбоя, поэтому падение тут не единственный критерий: сама
+    /// починка (слабый захват + обнуление handler'а) проверяется чтением диффа.
+    func testHundredSequentialProbesAllSucceedWithoutLeakingConnections() {
+        for _ in 0..<100 {
+            XCTAssertTrue(client.probe(host: "127.0.0.1", port: port, token: testToken, timeout: 3))
+        }
+    }
+
     // MARK: - manifest()
 
     func testManifestReturnsTextManifest() throws {

@@ -88,7 +88,17 @@ public final class NwHttpClient: HealthProbing, BlobFetching, @unchecked Sendabl
         let semaphore = DispatchSemaphore(value: 0)
         let requestHead = NwHttpClient.requestHead(path: path, host: host, token: token)
 
-        connection.stateUpdateHandler = { state in
+        // `[weak connection]` разрывает ARC-цикл: `connection.stateUpdateHandler`
+        // хранит это самое замыкание, и если бы оно захватывало `connection` сильно,
+        // получился бы самозамкнутый граф (connection -> handler -> connection),
+        // который ARC не в силах разорвать сам — объект жил бы до конца процесса
+        // (резидентный агент, вызовы на каждый хоткей/резолв соседа — то есть по
+        // одному такому графу на вызов, и без выхода). `connection.stateUpdateHandler
+        // = nil` ниже (и в перформе после `cancel()`) — вторая, независимая линия
+        // защиты: она освобождает замыкание сразу, не дожидаясь, пока `connection`
+        // потеряет последнюю сильную ссылку сама по себе.
+        connection.stateUpdateHandler = { [weak connection] state in
+            guard let connection else { return }
             switch state {
             case .ready:
                 // `NWConnection` может повторно войти в `.ready` после смены сетевого
@@ -111,21 +121,31 @@ public final class NwHttpClient: HealthProbing, BlobFetching, @unchecked Sendabl
                                                       box: box, semaphore: semaphore)
                     }
                 })
-            case .waiting(let error), .failed(let error):
+            case .waiting(let error):
                 // Эмпирически (macOS 14, loopback): отказ в соединении (ECONNREFUSED)
                 // даёт `.waiting`, а НЕ `.failed`, и в `.waiting` виснет бессрочно — без
-                // этой ветки клиент прождал бы весь `timeout` и вернул `.timeout` вместо
-                // требуемого `.transport`. `.waiting` по документации Apple обещает
-                // автоматический ретрай "when circumstances change", но этот клиент не
-                // держит долгоживущих соединений: каждый вызов — одна попытка на весь
-                // свой таймаут, так что полагаться на внутренний ретрай ОС смысла нет —
-                // трактуем `.waiting` как ту же немедленную ошибку, что и `.failed`.
+                // особого разбора клиент прождал бы весь `timeout` и вернул `.timeout`
+                // вместо требуемого `.transport`. Но `.waiting` — штатное состояние
+                // ожидания сети (смена маршрута, DNS, роуминг Wi-Fi, сосед ещё
+                // загружается), и в большинстве этих случаев соединение установилось
+                // бы само в пределах `timeout`. Поэтому завершаем немедленно только на
+                // классе «в соединении определённо отказано», а по всем прочим
+                // причинам `.waiting` даём таймауту отработать естественно.
+                guard NwHttpClient.isDefinitiveConnectionFailure(error) else { return }
+                if box.trySettle(.failure(.transport(String(describing: error)))) {
+                    semaphore.signal()
+                }
+            case .failed(let error):
                 if box.trySettle(.failure(.transport(String(describing: error)))) {
                     semaphore.signal()
                 }
             case .cancelled:
-                // Штатная отмена (после успеха или по таймауту) settle уже зафиксировала
-                // исход — trySettle тут не пройдёт и просто ничего не сделает.
+                // Штатная отмена (после успеха, ошибки или по таймауту) — settle уже
+                // зафиксировала исход, trySettle тут не пройдёт и просто ничего не
+                // сделает. Обнуляем handler и здесь тоже (вторая линия защиты от
+                // цикла — см. комментарий выше), на случай гонки, когда `perform()`
+                // не успел сделать это сам до того, как отмена долетела до колбэка.
+                connection.stateUpdateHandler = nil
                 if box.trySettle(.failure(.transport("соединение отменено до ответа"))) {
                     semaphore.signal()
                 }
@@ -144,15 +164,34 @@ public final class NwHttpClient: HealthProbing, BlobFetching, @unchecked Sendabl
             // уже никто не ждёт, и не тронет состояние, которое мы сейчас читаем.
             box.markSettledExternally()
             connection.cancel()
+            connection.stateUpdateHandler = nil
             throw HttpClientError.timeout
         }
 
         connection.cancel()
+        connection.stateUpdateHandler = nil
 
         switch box.consume() {
         case .success(let outcome): return outcome
         case .failure(let error): throw error
         case nil: throw HttpClientError.transport("соединение завершилось без ответа")
+        }
+    }
+
+    /// `.waiting` с такой причиной не разрешится само по себе — это отказ на уровне
+    /// сети/хоста, а не временная задержка. Сюда попадает эмпирически проверенный
+    /// ECONNREFUSED (недостижимый порт на 127.0.0.1 виснет в `.waiting` бессрочно, см.
+    /// комментарий у вызова) и явно родственные коды того же класса «пункт назначения
+    /// определённо недостижим прямо сейчас». Любая другая причина `.waiting` (DNS,
+    /// смена маршрута, Wi-Fi роуминг, сосед ещё не поднял сокет) может разрешиться в
+    /// пределах `timeout` — по ней клиент ждёт естественного таймаута, а не рвёт сразу.
+    private static func isDefinitiveConnectionFailure(_ error: NWError) -> Bool {
+        guard case .posix(let code) = error else { return false }
+        switch code {
+        case .ECONNREFUSED, .EHOSTUNREACH, .ENETUNREACH, .EHOSTDOWN, .ENETDOWN:
+            return true
+        default:
+            return false
         }
     }
 
