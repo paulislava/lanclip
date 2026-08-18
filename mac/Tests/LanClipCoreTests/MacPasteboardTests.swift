@@ -94,6 +94,20 @@ final class MacPasteboardTests: XCTestCase {
         XCTAssertEqual(Set(urls.map { $0.path }), Set([a.path, b.path]))
     }
 
+    // MARK: - Легаси NSFilenamesPboardType для старых приложений
+
+    func testWriteFilesAlsoDeclaresLegacyFilenamesPropertyList() throws {
+        let a = try makeFile("a.txt", "aaa")
+        let b = try makeFile("b.txt", "bbb")
+        try sut.write(.files([a, b]))
+
+        let legacyType = NSPasteboard.PasteboardType("NSFilenamesPboardType")
+        guard let filenames = pasteboard.propertyList(forType: legacyType) as? [String] else {
+            return XCTFail("ожидался property list строк по NSFilenamesPboardType")
+        }
+        XCTAssertEqual(filenames, [a.path, b.path])
+    }
+
     // MARK: - Порядок определения типа: файлы побеждают текстовое представление
 
     func testFilesWinOverTextRepresentationWhenBothPresent() throws {
