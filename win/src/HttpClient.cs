@@ -6,11 +6,24 @@ using System.Text;
 
 namespace LanClip
 {
+    // Итог одной health-пробы — находка I10 финального ревью. Зеркало
+    // mac-стороннего ProbeOutcome: раньше Probe() возвращал голый bool, поэтому
+    // 401 (сосед жив, но отверг токен) и отказ соединения (сосед выключен/
+    // недостижим) сворачивались в одно и то же "сосед не найден". Опечатка при
+    // переносе токена — самая вероятная ошибка первой настройки, и старое
+    // сообщение отправляло пользователя чинить сеть/файрвол вместо конфига.
+    enum ProbeOutcome
+    {
+        Alive,
+        RejectedToken,
+        Unreachable
+    }
+
     // Проверка живости соседа: GET /health с ожиданием на timeoutMs, без деталей
     // ошибки. Зеркало mac/Sources/LanClipCore/HttpClient.swift: HealthProbing.
     interface IHealthProber
     {
-        bool Probe(string host, int port, string token, int timeoutMs);
+        ProbeOutcome Probe(string host, int port, string token, int timeoutMs);
     }
 
     // Загрузка манифеста и блобов буфера соседа. Зеркало mac-стороннего BlobFetching.
@@ -106,23 +119,33 @@ namespace LanClip
 
         // MARK: - IHealthProber
 
-        public bool Probe(string host, int port, string token, int probeTimeoutMs)
+        // Perform() (см. ниже) контрактно либо возвращает ответ со статусом РОВНО
+        // 200, либо бросает HttpClientException — для ЛЮБОГО другого статуса,
+        // включая 401 (см. HttpServer.Route: неверный/отсутствующий токен) и 3xx
+        // (недоверенный сосед мог ответить редиректом — см. находку I5). Поэтому
+        // единственное, что здесь нужно различить, — это конкретно
+        // HttpClientException.CodeStatus со Status == 401 (сосед жив, токен
+        // неверный) от всего остального (сосед недостижим, тайм-аут, любой другой
+        // статус — не lanclip на этом порту).
+        public ProbeOutcome Probe(string host, int port, string token, int probeTimeoutMs)
         {
             try
             {
                 HttpWebResponse response = Perform(host, port, token, "/health", probeTimeoutMs);
-                try
+                response.Close();
+                return ProbeOutcome.Alive;
+            }
+            catch (HttpClientException e)
+            {
+                if (e.Code == HttpClientException.CodeStatus && e.Status == 401)
                 {
-                    return (int)response.StatusCode == 200;
+                    return ProbeOutcome.RejectedToken;
                 }
-                finally
-                {
-                    response.Close();
-                }
+                return ProbeOutcome.Unreachable;
             }
             catch (Exception)
             {
-                return false;
+                return ProbeOutcome.Unreachable;
             }
         }
 

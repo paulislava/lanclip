@@ -10,12 +10,15 @@ namespace LanClip.Tests
         // резолверу ходить в сеть повторно, пока не сброшен.
         class FakeProber : IHealthProber
         {
-            readonly Dictionary<string, bool> alive;
+            readonly Dictionary<string, ProbeOutcome> outcomes = new Dictionary<string, ProbeOutcome>();
             public readonly Dictionary<string, int> CallCounts = new Dictionary<string, int>();
 
             public FakeProber(Dictionary<string, bool> alive)
             {
-                this.alive = alive;
+                foreach (KeyValuePair<string, bool> pair in alive)
+                {
+                    outcomes[pair.Key] = pair.Value ? ProbeOutcome.Alive : ProbeOutcome.Unreachable;
+                }
             }
 
             public int TotalCalls
@@ -30,17 +33,24 @@ namespace LanClip.Tests
 
             public void SetAlive(bool isAlive, string host)
             {
-                alive[host] = isAlive;
+                outcomes[host] = isAlive ? ProbeOutcome.Alive : ProbeOutcome.Unreachable;
             }
 
-            public bool Probe(string host, int port, string token, int timeoutMs)
+            // Находка I10: позволяет тестам смоделировать "сосед жив, но отверг
+            // токен" — третий исход, который раньше IHealthProber не мог выразить.
+            public void SetOutcome(string host, ProbeOutcome outcome)
+            {
+                outcomes[host] = outcome;
+            }
+
+            public ProbeOutcome Probe(string host, int port, string token, int timeoutMs)
             {
                 int count;
                 CallCounts.TryGetValue(host, out count);
                 CallCounts[host] = count + 1;
 
-                bool result;
-                return alive.TryGetValue(host, out result) && result;
+                ProbeOutcome result;
+                return outcomes.TryGetValue(host, out result) ? result : ProbeOutcome.Unreachable;
             }
         }
 
@@ -162,6 +172,50 @@ namespace LanClip.Tests
 
                 T.Eq(null, resolver.Resolve(), "resolved");
                 T.Eq(0, prober.TotalCalls, "no probing for empty peers");
+            });
+
+            // MARK: - I10: неверный токен неотличим от выключенного соседа
+
+            T.Run("resolve remembers token rejection when no peer is alive", delegate
+            {
+                FakeProber prober = new FakeProber(Alive());
+                prober.SetOutcome("10.0.0.1", ProbeOutcome.RejectedToken);
+                prober.SetOutcome("10.0.0.2", ProbeOutcome.Unreachable);
+                PeerResolver resolver = new PeerResolver(
+                    MakeConfig(new List<string> { "10.0.0.1", "10.0.0.2" }), prober);
+
+                T.Eq(null, resolver.Resolve(), "resolved");
+                T.True(resolver.LastResolveSawTokenRejection,
+                    "хотя бы один сосед ответил 401 — это обязано отличаться от полностью мёртвой сети");
+            });
+
+            T.Run("resolve does not report token rejection when all peers are unreachable", delegate
+            {
+                FakeProber prober = new FakeProber(Alive());
+                prober.SetOutcome("10.0.0.1", ProbeOutcome.Unreachable);
+                prober.SetOutcome("10.0.0.2", ProbeOutcome.Unreachable);
+                PeerResolver resolver = new PeerResolver(
+                    MakeConfig(new List<string> { "10.0.0.1", "10.0.0.2" }), prober);
+
+                T.Eq(null, resolver.Resolve(), "resolved");
+                T.True(!resolver.LastResolveSawTokenRejection,
+                    "ни один сосед не ответил вовсе — это не то же самое, что отвергнутый токен");
+            });
+
+            T.Run("successful resolve clears prior token rejection flag", delegate
+            {
+                FakeProber prober = new FakeProber(Alive());
+                prober.SetOutcome("10.0.0.1", ProbeOutcome.RejectedToken);
+                PeerResolver resolver = new PeerResolver(MakeConfig(new List<string> { "10.0.0.1" }), prober);
+
+                T.Eq(null, resolver.Resolve(), "resolved");
+                T.True(resolver.LastResolveSawTokenRejection, "premise");
+
+                prober.SetOutcome("10.0.0.1", ProbeOutcome.Alive);
+                resolver.Invalidate();
+                T.Eq("10.0.0.1", resolver.Resolve(), "resolved after fix");
+                T.True(!resolver.LastResolveSawTokenRejection,
+                    "успешный Resolve() обязан сбросить прежний флаг отверженного токена");
             });
         }
     }

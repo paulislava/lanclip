@@ -31,9 +31,19 @@ namespace LanClip.Tests
                 alive = value;
             }
 
-            public bool Probe(string host, int port, string token, int timeoutMs)
+            public ProbeOutcome Probe(string host, int port, string token, int timeoutMs)
             {
-                return alive;
+                return alive ? ProbeOutcome.Alive : ProbeOutcome.Unreachable;
+            }
+        }
+
+        // Находка I10: FakeProber выше знает только "жив/не жив" — этому тесту
+        // нужен третий исход (сосед отвечает, но отвергает токен).
+        class RejectingProber : IHealthProber
+        {
+            public ProbeOutcome Probe(string host, int port, string token, int timeoutMs)
+            {
+                return ProbeOutcome.RejectedToken;
             }
         }
 
@@ -521,9 +531,27 @@ namespace LanClip.Tests
 
                 PullException caught = ExpectThrows(new Action(delegate { client.Pull(); }));
                 T.Eq(PullException.CodeNoPeer, caught.Code, "code");
+                T.True(!caught.TokenRejected, "полностью выключенный сосед — это не отверженный токен");
                 T.Eq(0, fetcher.ManifestCallCount, "no manifest call");
                 T.True(writer.Written.Count == 0, "no write");
                 T.Eq("прежнее содержимое", writer.Content.Text, "clipboard untouched");
+            });
+
+            // Находка I10 финального ревью: когда сосед отвечает, но отвергает
+            // токен, Pull() обязан пробросить это наружу через
+            // PullException.NoPeer(tokenRejected: true), а не сворачивать в тот же
+            // исход, что и полностью выключенный сосед.
+            T.Run("no live peer with token rejection reports it in PullException", delegate
+            {
+                Config config = MakeConfig(Config.DefaultMaxBytes);
+                FakeFetcher fetcher = new FakeFetcher();
+                FakeClipboard writer = new FakeClipboard();
+                PeerResolver resolver = new PeerResolver(config, new RejectingProber());
+                PullClient client = new PullClient(config, resolver, fetcher, MakeStaging(), writer);
+
+                PullException caught = ExpectThrows(new Action(delegate { client.Pull(); }));
+                T.Eq(PullException.CodeNoPeer, caught.Code, "code");
+                T.True(caught.TokenRejected, "сосед ответил 401 — обязано отражаться в TokenRejected");
             });
 
             T.Run("transport error during manifest invalidates resolver cache", delegate

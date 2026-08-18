@@ -257,7 +257,7 @@ namespace LanClip
                 }
                 else
                 {
-                    Console.WriteLine("Сосед не найден");
+                    Console.WriteLine(NoPeerMessage(resolver));
                 }
             }
             finally
@@ -284,7 +284,7 @@ namespace LanClip
             string peer = resolver.Resolve();
             if (peer == null)
             {
-                Console.WriteLine("Сосед не найден");
+                Console.WriteLine(NoPeerMessage(resolver));
                 return 1;
             }
 
@@ -429,7 +429,7 @@ namespace LanClip
             switch (pullError.Code)
             {
                 case PullException.CodeNoPeer:
-                    return "Сосед не найден: никто из адресов в \"peers\" не отвечает.";
+                    return NoPeerMessage(pullError.TokenRejected);
                 case PullException.CodePeerEmpty:
                     return "Буфер соседа пуст — нечего забирать.";
                 case PullException.CodeTooLarge:
@@ -444,6 +444,28 @@ namespace LanClip
                 default:
                     return "Непредвиденная ошибка Pull(): " + Describe(pullError);
             }
+        }
+
+        // MARK: - "Сосед не найден" -> человекочитаемая строка (находка I10)
+
+        // Единая формулировка для всех трёх мест, где CLI сообщает об отсутствии
+        // соседа (status/get/DescribePullFailure) — раньше "сосед не найден"
+        // печаталось одинаково и при полностью выключенном соседе, и при неверном
+        // токене (сосед ответил 401), из-за чего опечатка в конфиге выглядела как
+        // сетевая/файрвольная проблема. Зеркало mac-стороннего noPeerMessage(_:).
+        static string NoPeerMessage(bool tokenRejected)
+        {
+            if (tokenRejected)
+            {
+                return "Сосед ответил, но отверг токен (401). Проверьте, что поле \"token\" в конфиге "
+                    + "совпадает на обеих машинах.";
+            }
+            return "Сосед не найден: никто из адресов в \"peers\" не отвечает.";
+        }
+
+        static string NoPeerMessage(PeerResolver resolver)
+        {
+            return NoPeerMessage(resolver.LastResolveSawTokenRejection);
         }
 
         // MARK: - Тост про файлы после хоткея

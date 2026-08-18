@@ -16,6 +16,12 @@ namespace LanClip
 
         readonly object gate = new object();
         string cachedAddress;
+        // Находка I10 финального ревью: запоминает, ответил ли хоть один адрес из
+        // Peers в ПОСЛЕДНЕМ переборе, но отверг токен (ProbeOutcome.RejectedToken).
+        // Позволяет вызывающей стороне (PullClient, Program.cs) отличить "сосед
+        // выключен/недостижим" от "сосед жив, но токен не совпадает" — раньше оба
+        // случая давали одно и то же null из Resolve().
+        bool sawTokenRejection;
 
         public PeerResolver(Config config, IHealthProber prober)
             : this(config, prober, DefaultProbeTimeoutMs)
@@ -43,22 +49,49 @@ namespace LanClip
                 }
             }
 
+            bool tokenRejectedByAnyPeer = false;
             if (config.Peers != null)
             {
                 foreach (string host in config.Peers)
                 {
-                    if (prober.Probe(host, config.Port, config.Token, probeTimeoutMs))
+                    ProbeOutcome outcome = prober.Probe(host, config.Port, config.Token, probeTimeoutMs);
+                    if (outcome == ProbeOutcome.Alive)
                     {
                         lock (gate)
                         {
                             cachedAddress = host;
+                            sawTokenRejection = false;
                         }
                         return host;
+                    }
+                    if (outcome == ProbeOutcome.RejectedToken)
+                    {
+                        tokenRejectedByAnyPeer = true;
                     }
                 }
             }
 
+            lock (gate)
+            {
+                sawTokenRejection = tokenRejectedByAnyPeer;
+            }
             return null;
+        }
+
+        // true, если последний (неудачный) Resolve() увидел хотя бы один ответ с
+        // отвергнутым токеном — см. PullException.NoPeer(tokenRejected:). Отражает
+        // только САМЫЙ ПОСЛЕДНИЙ перебор: успешный Resolve() (нашёл живого) сам
+        // сбрасывает флаг в false, а Invalidate() намеренно его не трогает —
+        // значение имеет смысл только сразу после Resolve(), вернувшего null.
+        public bool LastResolveSawTokenRejection
+        {
+            get
+            {
+                lock (gate)
+                {
+                    return sawTokenRejection;
+                }
+            }
         }
 
         // Сбрасывает кеш живого адреса — следующий Resolve() начнёт перебор

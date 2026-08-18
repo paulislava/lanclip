@@ -19,40 +19,50 @@ namespace LanClip
         public readonly string Code;
         public readonly long TotalSize; // осмысленно только при Code == CodeTooLarge
         public readonly long MaxBytes;  // осмысленно только при Code == CodeTooLarge
+        // Находка I10 финального ревью: осмысленно только при Code == CodeNoPeer.
+        // Раньше NoPeer покрывал и "никто не отвечает" (сеть/файрвол), и "сосед
+        // ответил 401" (опечатка в токене) одним и тем же случаем — true, если
+        // хотя бы один адрес из peers ответил, но отверг токен (см.
+        // PeerResolver.LastResolveSawTokenRejection).
+        public readonly bool TokenRejected;
 
-        PullException(string code, long totalSize, long maxBytes, string message)
+        PullException(string code, long totalSize, long maxBytes, bool tokenRejected, string message)
             : base(message)
         {
             Code = code;
             TotalSize = totalSize;
             MaxBytes = maxBytes;
+            TokenRejected = tokenRejected;
         }
 
-        public static PullException NoPeer()
+        public static PullException NoPeer(bool tokenRejected)
         {
-            return new PullException(CodeNoPeer, 0, 0, "нет ни одного живого соседа");
+            string message = tokenRejected
+                ? "сосед ответил, но отверг токен (401): проверьте поле token в конфиге"
+                : "нет ни одного живого соседа";
+            return new PullException(CodeNoPeer, 0, 0, tokenRejected, message);
         }
 
         public static PullException PeerEmpty()
         {
-            return new PullException(CodePeerEmpty, 0, 0, "буфер соседа пуст");
+            return new PullException(CodePeerEmpty, 0, 0, false, "буфер соседа пуст");
         }
 
         public static PullException TooLarge(long totalSize, long maxBytes)
         {
-            return new PullException(CodeTooLarge, totalSize, maxBytes,
+            return new PullException(CodeTooLarge, totalSize, maxBytes, false,
                 "содержимое соседа " + totalSize + " байт превышает предел " + maxBytes + " байт");
         }
 
         public static PullException Changed()
         {
-            return new PullException(CodeChanged, 0, 0,
+            return new PullException(CodeChanged, 0, 0, false,
                 "буфер соседа изменился во время передачи, повторите позже");
         }
 
         public static PullException Transport(string detail)
         {
-            return new PullException(CodeTransport, 0, 0, "ошибка транспорта: " + detail);
+            return new PullException(CodeTransport, 0, 0, false, "ошибка транспорта: " + detail);
         }
     }
 
@@ -112,7 +122,7 @@ namespace LanClip
             string host = resolver.Resolve();
             if (host == null)
             {
-                throw PullException.NoPeer();
+                throw PullException.NoPeer(resolver.LastResolveSawTokenRejection);
             }
 
             try
