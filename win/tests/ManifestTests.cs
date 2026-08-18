@@ -87,6 +87,17 @@ namespace LanClip.Tests
                     Manifest.FromJson("{\"kind\":\"video\",\"seq\":1}");
                 }, "unknown kind");
             });
+
+            T.Run("rejects blobs element that is not an object", delegate
+            {
+                // Сосед прислал мусор с провода вместо BlobRef-объекта — должен
+                // получиться тот же FormatException, что и на прочих битых
+                // манифестах, а не InvalidCastException из-за прямого каста.
+                T.Throws<FormatException>(delegate
+                {
+                    Manifest.FromJson("{\"kind\":\"files\",\"seq\":1,\"blobs\":[\"oops\"]}");
+                }, "blobs element not an object");
+            });
         }
     }
 }

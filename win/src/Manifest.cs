@@ -135,7 +135,11 @@ namespace LanClip
                 List<BlobRef> blobs = new List<BlobRef>();
                 foreach (object item in rawBlobs)
                 {
-                    Dictionary<string, object> b = (Dictionary<string, object>)item;
+                    Dictionary<string, object> b = item as Dictionary<string, object>;
+                    if (b == null)
+                    {
+                        throw new FormatException("элемент blobs должен быть JSON-объектом, получено: " + item);
+                    }
                     BlobRef blob = new BlobRef();
                     blob.I = Json.Int(b, "i", 0);
                     blob.Rel = Json.Str(b, "rel", "");
