@@ -125,7 +125,17 @@ public final class PullClient {
     private func fetchManifest(host: String) throws -> Manifest {
         do {
             return try fetcher.manifest(host: host, port: config.port, token: config.token)
-        } catch let error as HttpClientError {
+        } catch {
+            // Находка I9 финального ревью: ловился только `HttpClientError`. Если сосед
+            // пришлёт что-то, что проходит HTTP-транспорт (200 OK), но не разбирается как
+            // валидный `Manifest` (`{"kind":"weird"}`, `"totalSize":"5"` вместо числа —
+            // `JSONDecoder` в отличие от C#-стороннего `Convert` строгий и такое не
+            // примет), `fetcher.manifest(...)` бросает сырой `DecodingError`, который не
+            // ловился этим `catch` — ошибка улетала из `pull()` необёрнутой в `PullError`,
+            // и, что хуже, `resolver.invalidate()` не вызывался: Mac продолжил бы
+            // долбиться в того же испорченного соседа с закешированным адресом. Любая
+            // ошибка на этом пути — сорванный обмен с соседом того же класса, что и
+            // `HttpClientError`, поэтому ловится и оборачивается одинаково.
             resolver.invalidate()
             throw PullError.transport(String(describing: error))
         }

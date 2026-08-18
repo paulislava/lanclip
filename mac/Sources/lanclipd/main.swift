@@ -246,11 +246,13 @@ func configErrorMessage(_ error: Error, configURL: URL) -> String {
 
 // MARK: - PullError → человекочитаемая строка
 
-/// Carried-over note (задача 11): `PullClient.pull()` ловит только `HttpClientError`
-/// на пути `fetchManifest` — совсем битый JSON от соседа долетит сюда сырым
-/// `DecodingError`, а не `PullError`. Разбор `PullError` по случаям — правильно, но
-/// ветка "всё остальное" обязана существовать и не превращаться в голый
-/// `Optional(...)` дамп.
+/// Находка I9 финального ревью починила `PullClient.fetchManifest` так, что он
+/// теперь ловит ЛЮБУЮ ошибку разбора манифеста (не только `HttpClientError`) и
+/// оборачивает её в `PullError.transport(...)`, поэтому битый JSON от соседа
+/// больше не долетает сюда сырым `DecodingError`. Ветка "всё остальное" всё
+/// равно остаётся — она защищает от ошибок из других мест `pull()` (стейджинг,
+/// запись в буфер), которые в `PullError` не оборачиваются и не должны
+/// превращаться в голый `Optional(...)` дамп.
 func describePullFailure(_ error: Error) -> String {
     guard let pullError = error as? PullError else {
         return "Непредвиденная ошибка при pull(): \(describe(error))"

@@ -183,14 +183,14 @@ namespace LanClip
             throw new FormatException("неизвестный kind манифеста: " + kind);
         }
 
+        // Находка I9 финального ревью: раньше делали Convert.ToInt64 напрямую —
+        // принимали "5" (строку) и 1.5 (дробное) молча, расходясь со строгим
+        // Swift-стороним JSONDecoder. Делегируют в Json.Long/Json.NullableLong —
+        // единственное место в проекте, где решается "строгий тип или отказ" для
+        // целых чисел JSON, а не задваивают эту логику здесь.
         static long ToLong(Dictionary<string, object> o, string key)
         {
-            object value;
-            if (o.TryGetValue(key, out value) && value != null)
-            {
-                return Convert.ToInt64(value);
-            }
-            return 0;
+            return Json.Long(o, key, 0);
         }
 
         // Отдельно от ToLong (которая всегда возвращает число, подставляя 0 для
@@ -200,12 +200,7 @@ namespace LanClip
         // здесь означает именно "отсутствовало", а не "равно нулю".
         static long? ToNullableLong(Dictionary<string, object> o, string key)
         {
-            object value;
-            if (o.TryGetValue(key, out value) && value != null)
-            {
-                return Convert.ToInt64(value);
-            }
-            return null;
+            return Json.NullableLong(o, key);
         }
     }
 }

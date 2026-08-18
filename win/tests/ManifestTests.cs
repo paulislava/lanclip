@@ -88,6 +88,39 @@ namespace LanClip.Tests
                 }, "unknown kind");
             });
 
+            // MARK: - I9: строгость разбора чисел обязана совпадать со Swift-стороним JSONDecoder
+
+            T.Run("rejects seq given as a JSON string instead of a number", delegate
+            {
+                // Convert.ToInt32("5") раньше молча парсил строку как число —
+                // JSONDecoder на Mac для Int-поля такое отвергает как DecodingError.
+                // Множество манифестов, принимаемых одной стороной и отвергаемых
+                // другой, было непустым; теперь обе стороны отвергают одинаково.
+                T.Throws<FormatException>(delegate
+                {
+                    Manifest.FromJson("{\"kind\":\"empty\",\"seq\":\"5\"}");
+                }, "seq as string");
+            });
+
+            T.Run("rejects totalSize given as a fractional JSON number", delegate
+            {
+                // Convert.ToInt64(1.5) раньше молча округлял вместо отказа.
+                T.Throws<FormatException>(delegate
+                {
+                    Manifest.FromJson(
+                        "{\"kind\":\"files\",\"seq\":1,\"totalSize\":1.5,\"blobs\":[{\"i\":0,\"rel\":\"a\",\"size\":1}]}");
+                }, "totalSize as fractional number");
+            });
+
+            T.Run("rejects blob size given as a JSON string instead of a number", delegate
+            {
+                T.Throws<FormatException>(delegate
+                {
+                    Manifest.FromJson(
+                        "{\"kind\":\"files\",\"seq\":1,\"blobs\":[{\"i\":0,\"rel\":\"a\",\"size\":\"5\"}]}");
+                }, "blob size as string");
+            });
+
             T.Run("rejects blobs element that is not an object", delegate
             {
                 // Сосед прислал мусор с провода вместо BlobRef-объекта — должен

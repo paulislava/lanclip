@@ -399,6 +399,38 @@ final class PullClientTests: XCTestCase {
         XCTAssertNil(resolver.resolve(), "после ошибки транспорта кеш должен быть сброшен, иначе резолвер отдал бы старый адрес не проверяя")
     }
 
+    /// I9 (находка финального ревью): `fetchManifest` раньше ловил только
+    /// `HttpClientError` — совсем битый или самопротиворечивый JSON от соседа
+    /// (`{"kind":"weird"}`, `"totalSize":"5"` вместо числа) даёт `DecodingError`,
+    /// который не оборачивается в `PullError` и, главное, не сбрасывает кеш
+    /// резолвера. `FakeFetcher.manifestResult` — `Result<Manifest, Error>`, поэтому
+    /// сюда можно подставить ЛЮБОЙ тип ошибки, не только `HttpClientError`.
+    func testNonHttpClientErrorDuringManifestParsingIsTreatedAsTransportAndInvalidatesCache() throws {
+        struct FakeDecodingFailure: Error, CustomStringConvertible {
+            var description: String { "притворная поломка JSONDecoder" }
+        }
+
+        let config = makeConfig()
+        let prober = FakeProber(alive: true)
+        let fetcher = FakeFetcher()
+        fetcher.manifestResult = .failure(FakeDecodingFailure())
+        let writer = FakeClipboard()
+        let (client, resolver) = makeClient(config: config, prober: prober, fetcher: fetcher, writer: writer)
+
+        XCTAssertEqual(resolver.resolve(), "10.0.0.2", "warm resolve")
+
+        XCTAssertThrowsError(try client.pull()) { error in
+            guard case .transport = error as? PullError else {
+                return XCTFail("ожидали .transport, получили \(error)")
+            }
+        }
+        XCTAssertTrue(writer.written.isEmpty)
+
+        prober.setAlive(false)
+        XCTAssertNil(resolver.resolve(),
+                      "неожиданный тип ошибки разбора манифеста тоже обязан сбрасывать кеш резолвера")
+    }
+
     func testTransportErrorDuringBlobFetchInvalidatesResolverCache() throws {
         let config = makeConfig()
         let prober = FakeProber(alive: true)
