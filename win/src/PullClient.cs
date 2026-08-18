@@ -209,16 +209,17 @@ namespace LanClip
                     }
                 }
 
-                // Manifest.TotalSize — обычный long (не long?, в отличие от Mac-стороннего
-                // Int?): Manifest.FromJson не различает "totalSize отсутствовал в JSON" и
-                // "totalSize явно прислали равным 0". 0 трактуется здесь как "не
-                // заявлено", и проверка расхождения для этого случая пропускается — но
-                // граница maxBytes от этого не страдает НИКОГДА: она двумя строками выше
+                // Manifest.TotalSize — long? (зеркало Mac-стороннего Int?, после
+                // починки Manifest.cs по итогам ревью задачи 21): null означает "поле
+                // отсутствовало в JSON", а не "прислали 0" — поэтому сосед, честно
+                // приславший totalSize:0 при ненулевой сумме blobs, ловится этой
+                // проверкой наравне с любым другим расхождением. Граница maxBytes при
+                // этом ни в одном случае не ослабляется: она двумя строками выше
                 // считается по computedTotal, а не по TotalSize, независимо от исхода
                 // этой проверки.
-                if (manifest.TotalSize != 0 && manifest.TotalSize != computedTotal)
+                if (manifest.TotalSize.HasValue && manifest.TotalSize.Value != computedTotal)
                 {
-                    throw CorruptedManifest("totalSize=" + manifest.TotalSize
+                    throw CorruptedManifest("totalSize=" + manifest.TotalSize.Value
                         + " в манифесте расходится с суммой по blobs=" + computedTotal);
                 }
                 return computedTotal;

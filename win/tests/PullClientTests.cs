@@ -477,7 +477,7 @@ namespace LanClip.Tests
                 // гонка с соседским буфером.
                 Manifest manifest = Manifest.FromJson(
                     "{\"kind\":\"files\",\"seq\":1,\"totalSize\":1,\"blobs\":[{\"i\":0,\"rel\":\"big.bin\",\"size\":999999999,\"mime\":null}]}");
-                T.Eq(1L, manifest.TotalSize, "premise: declared totalSize taken as-is");
+                T.Eq((long?)1L, manifest.TotalSize, "premise: declared totalSize taken as-is");
 
                 Config config = MakeConfig(Config.DefaultMaxBytes);
                 FakeFetcher fetcher = new FakeFetcher();
@@ -498,11 +498,48 @@ namespace LanClip.Tests
                 T.Eq(null, resolver.Resolve(), "расхождение totalSize с суммой blobs обязано сбрасывать кеш резолвера");
             });
 
+            T.Run("manifest with totalSize explicitly zero but nonzero blob sum is treated as corrupted transport", delegate
+            {
+                // Находка ревью задачи 21: Manifest.TotalSize раньше был обычным long,
+                // и "totalSize отсутствовал" было неотличимо от "totalSize явно 0" —
+                // сосед, честно приславший totalSize:0 при блобе на 500 байт, проезжал
+                // мимо проверки расхождения, блоб скачивался и записывался в буфер
+                // успешно. Manifest.TotalSize теперь long? — 0, присланный явно,
+                // обязан ловиться этой проверкой точно так же, как и любое другое
+                // числовое расхождение.
+                Manifest manifest = Manifest.FromJson(
+                    "{\"kind\":\"files\",\"seq\":1,\"totalSize\":0,\"blobs\":[{\"i\":0,\"rel\":\"a.bin\",\"size\":500,\"mime\":null}]}");
+                T.Eq((long?)0L, manifest.TotalSize, "premise: totalSize present and equal to zero, not absent");
+
+                Config config = MakeConfig(Config.DefaultMaxBytes);
+                FakeFetcher fetcher = new FakeFetcher();
+                fetcher.ManifestResult = manifest;
+                // Блоб реально доступен и ровно того размера, что заявлен в blobs —
+                // если бы проверка расхождения не сработала, скачивание и сверка
+                // фактического размера прошли бы молча, и pull завершился бы успехом.
+                fetcher.BlobResults[0] = new byte[500];
+                FakeClipboard writer = new FakeClipboard();
+                FakeProber prober = new FakeProber(true);
+                PeerResolver resolver;
+                PullClient client = MakeClient(config, prober, fetcher, writer, out resolver);
+
+                T.Eq("10.0.0.2", resolver.Resolve(), "warm resolve");
+
+                PullException caught = ExpectThrows(new Action(delegate { client.Pull(); }));
+                T.Eq(PullException.CodeTransport, caught.Code, "code");
+                T.True(writer.Written.Count == 0, "no write");
+                T.Eq(0, fetcher.BlobCallIndexes.Count,
+                    "загрузка не должна начинаться для манифеста с totalSize:0 при ненулевой сумме blobs");
+
+                prober.SetAlive(false);
+                T.Eq(null, resolver.Resolve(), "явный totalSize:0 при расхождении с суммой обязан сбрасывать кеш резолвера");
+            });
+
             T.Run("computed total size from blobs governs tooLarge even when manifest omits totalSize", delegate
             {
                 Manifest manifest = Manifest.FromJson(
                     "{\"kind\":\"files\",\"seq\":1,\"blobs\":[{\"i\":0,\"rel\":\"big.bin\",\"size\":999999999,\"mime\":null}]}");
-                T.Eq(0L, manifest.TotalSize, "premise: totalSize key absent from JSON");
+                T.Eq(null, manifest.TotalSize, "premise: totalSize key genuinely absent from JSON, not zero");
 
                 Config config = MakeConfig(10);
                 FakeFetcher fetcher = new FakeFetcher();
@@ -516,6 +553,32 @@ namespace LanClip.Tests
                 T.Eq(999999999L, caught.TotalSize, "total size");
                 T.True(writer.Written.Count == 0, "no write");
                 T.Eq(0, fetcher.BlobCallIndexes.Count, "загрузка не должна начинаться при превышении лимита");
+            });
+
+            T.Run("manifest without totalSize field is still accepted and pulls successfully", delegate
+            {
+                // Симметричный контроль к предыдущим двум: отсутствие totalSize —
+                // законное состояние (агенты старых версий, минимальные ручные
+                // манифесты), а не то же самое, что искажённый totalSize:0. Пока
+                // фактический размер каждого файла совпадает с заявленным, пул обязан
+                // завершиться успехом, а не быть отвергнутым как испорченный манифест.
+                Manifest manifest = Manifest.FromJson(
+                    "{\"kind\":\"files\",\"seq\":1,\"blobs\":[{\"i\":0,\"rel\":\"a.bin\",\"size\":5,\"mime\":null}]}");
+                T.Eq(null, manifest.TotalSize, "premise: totalSize key absent from JSON");
+
+                Config config = MakeConfig(Config.DefaultMaxBytes);
+                FakeFetcher fetcher = new FakeFetcher();
+                fetcher.ManifestResult = manifest;
+                fetcher.BlobResults[0] = Encoding.UTF8.GetBytes("hello");
+                FakeClipboard writer = new FakeClipboard();
+                PeerResolver resolver;
+                PullClient client = MakeClient(config, new FakeProber(true), fetcher, writer, out resolver);
+
+                PullResult result = client.Pull();
+
+                T.Eq("files", result.Kind, "kind");
+                T.Eq(1, result.FileCount, "file count");
+                T.Eq(1, writer.Written.Count, "one write despite missing totalSize field");
             });
 
             T.Run("file arriving with wrong size is treated as corrupted transport", delegate

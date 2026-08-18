@@ -39,7 +39,7 @@ namespace LanClip.Tests
                 clipboard.Content = ClipContent.OfImage(png);
                 SnapshotStore store = new SnapshotStore(clipboard);
                 ClipSnapshot snapshot = store.Current();
-                T.Eq((long)png.Length, snapshot.Manifest.TotalSize, "totalSize");
+                T.Eq((long?)png.Length, snapshot.Manifest.TotalSize, "totalSize");
                 T.True(BytesEqual(png, store.Blob(0, snapshot.Manifest.Seq)), "blob bytes");
             });
 
@@ -94,7 +94,7 @@ namespace LanClip.Tests
                     T.Eq(2, rels.Count, "blob count");
                     T.Eq("папка/a.txt", rels[0], "rel 0");
                     T.Eq("папка/вложенная/b.txt", rels[1], "rel 1");
-                    T.Eq(3L, snapshot.Manifest.TotalSize, "totalSize");
+                    T.Eq((long?)3L, snapshot.Manifest.TotalSize, "totalSize");
                 }
                 finally
                 {

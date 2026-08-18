@@ -29,7 +29,7 @@ namespace LanClip.Tests
             T.Run("image describes single png blob", delegate
             {
                 Manifest manifest = Manifest.OfImage(48213, 43);
-                T.Eq(48213L, manifest.TotalSize, "totalSize");
+                T.Eq((long?)48213L, manifest.TotalSize, "totalSize");
                 T.Eq(1, manifest.Blobs.Count, "blob count");
                 BlobRef blob = manifest.Blobs[0];
                 T.Eq(0, blob.I, "blob.i");
@@ -49,7 +49,7 @@ namespace LanClip.Tests
                 blobs.Add(b);
 
                 Manifest manifest = Manifest.OfFiles(blobs, 44);
-                T.Eq(96354L, manifest.TotalSize, "totalSize");
+                T.Eq((long?)96354L, manifest.TotalSize, "totalSize");
                 T.Eq("files", manifest.Kind, "kind");
             });
 

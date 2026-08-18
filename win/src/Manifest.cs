@@ -17,7 +17,15 @@ namespace LanClip
         public int Seq;
         public string Text;
         public List<BlobRef> Blobs;
-        public long TotalSize;
+
+        // long? (не long, в отличие от прежней версии этого поля из задачи 16) —
+        // зеркало Mac-стороннего Manifest.totalSize: Int?. Без нулабельности
+        // "поле отсутствовало в JSON" и "поле явно прислано равным нулю"
+        // неразличимы, а PullClient (задача 21) обязан отличать одно от другого:
+        // сосед, честно приславший totalSize:0 при ненулевой сумме blobs, — это
+        // такой же сорванный манифест, как и любое другое расхождение, и не должен
+        // молча приниматься только потому, что 0 похож на "не заявлено".
+        public long? TotalSize;
 
         public static Manifest Empty(int seq)
         {
@@ -100,7 +108,15 @@ namespace LanClip
                     blobsJson.Add(bj);
                 }
                 obj["blobs"] = blobsJson;
-                obj["totalSize"] = TotalSize;
+                // Ключ totalSize кладётся, только когда значение реально есть —
+                // TotalSize.HasValue гарантированно true для манифестов, собранных
+                // через OfImage/OfFiles (единственный публичный способ создать
+                // манифест этих kind-ов не из чужого JSON), но защита не помешает:
+                // сериализация никогда не должна выдать буквальный "totalSize":null.
+                if (TotalSize.HasValue)
+                {
+                    obj["totalSize"] = TotalSize.Value;
+                }
             }
 
             return Json.Write(obj);
@@ -152,7 +168,7 @@ namespace LanClip
                 m.Kind = kind;
                 m.Seq = seq;
                 m.Blobs = blobs;
-                m.TotalSize = ToLong(obj, "totalSize");
+                m.TotalSize = ToNullableLong(obj, "totalSize");
                 return m;
             }
 
@@ -167,6 +183,21 @@ namespace LanClip
                 return Convert.ToInt64(value);
             }
             return 0;
+        }
+
+        // Отдельно от ToLong (которая всегда возвращает число, подставляя 0 для
+        // отсутствующего поля, — это верно для обязательного blob.size): totalSize
+        // необязателен, и вызывающая сторона (PullClient, задача 21) обязана уметь
+        // отличить "поля не было" от "поле было и равнялось нулю" — поэтому null
+        // здесь означает именно "отсутствовало", а не "равно нулю".
+        static long? ToNullableLong(Dictionary<string, object> o, string key)
+        {
+            object value;
+            if (o.TryGetValue(key, out value) && value != null)
+            {
+                return Convert.ToInt64(value);
+            }
+            return null;
         }
     }
 }
