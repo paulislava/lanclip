@@ -193,18 +193,33 @@ Write-Host "    готово"
 # ограниченное Private, никогда не сработало бы для реального трафика с Mac и
 # автозапуск выглядел бы рабочим (Get-ScheduledTask показывает задачу), но
 # /health с Mac не отвечал бы — то есть буквальное следование брифу не
-# прошло бы собственную же проверку из Шага 3 брифа. Меняю правило на
-# -Profile Any: это открывает только один конкретный порт для входящих
-# TCP-соединений в рамках одного именованного правила ("lanclip") и не
-# трогает ни категорию сети, ни остальные политики файрвола.
-Write-Step "Правило файрвола: TCP $Port, вход, все профили (см. отклонение от брифа выше)"
+# прошло бы собственную же проверку из Шага 3 брифа. Меняю профиль на Any.
+#
+# Но -Profile Any без ограничений открыл бы порт для входящих с ЛЮБОЙ сети,
+# в которую машина когда-либо попадёт (кафе, чужой Wi-Fi) — профиль тут не
+# помощник, раз реальная сеть уже сегодня классифицирована как Public. Чинить
+# это через Set-NetConnectionProfile (принудительно пометить адаптер как
+# Private) не вариант: это системная настройка доверия, которая влияет на
+# общий доступ к файлам, обнаружение в сети и все остальные правила профиля
+# Private — а адаптер к тому же может снова переклассифицироваться сам при
+# следующем переподключении, и придётся гоняться за этим бесконечно.
+#
+# Вместо этого сужаю правило по адресу источника через встроенное ключевое
+# слово "LocalSubnet" (а не буквальную "192.168.1.0/24"): Windows Firewall
+# вычисляет его динамически из фактической маски подсети активного
+# интерфейса на момент каждого соединения — правило продолжит корректно
+# работать, даже если роутер когда-нибудь выдаст другую подсеть, без ручной
+# правки. Итог: порт открыт независимо от профиля сети, но трафик всё равно
+# принимается только из локальной подсети машины — плюс токен как второй
+# рубеж поверх этого.
+Write-Step "Правило файрвола: TCP $Port, вход, любой профиль, только LocalSubnet"
 $existingRule = Get-NetFirewallRule -DisplayName $FirewallDisplayName -ErrorAction SilentlyContinue
 if ($existingRule) {
     Write-Host "    уже существует — пересоздаю"
     $existingRule | Remove-NetFirewallRule
 }
 New-NetFirewallRule -DisplayName $FirewallDisplayName -Direction Inbound -LocalPort $Port `
-    -Protocol TCP -Action Allow -Profile Any | Out-Null
+    -Protocol TCP -Action Allow -Profile Any -RemoteAddress LocalSubnet | Out-Null
 Write-Host "    готово"
 
 # --- Шаг 7: задача планировщика. ---
@@ -219,7 +234,16 @@ Write-Host "    готово"
 # оконной станции WinSta0) — ровно та поломка из ai/ERRORS.md.
 Write-Step "Задача планировщика: $TaskName"
 
-$innerCommand = "& '{0}' serve --config '{1}'" -f $BinDest, $ConfigFile
+# "; exit $LASTEXITCODE" в конце — не украшение. RestartCount/RestartInterval
+# ниже срабатывают у Task Scheduler по коду возврата ДЕЙСТВИЯ задачи, то есть
+# этого powershell.exe-обёртки, а не lanclipd.exe напрямую. Без явного exit
+# код возврата wrapper'а определяется тем, чем завершится сам powershell.exe
+# -Command, а не гарантированно кодом упавшей нативной команды — при падении
+# lanclipd.exe планировщик рисковал бы увидеть "успешное" завершение обёртки
+# и не перезапустить агента вовсе, то есть спроектированная страховка была бы
+# мертворождённой. $LASTEXITCODE после "&" на нативный .exe — это как раз код
+# возврата именно lanclipd.exe.
+$innerCommand = "& '{0}' serve --config '{1}'; exit `$LASTEXITCODE" -f $BinDest, $ConfigFile
 $wrapperArgs = "-NoProfile -WindowStyle Hidden -Command `"$innerCommand`""
 
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $wrapperArgs
@@ -229,9 +253,20 @@ $principalTask = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Inte
 # ExecutionTimeLimit по умолчанию у Task Scheduler — 72 часа: по истечении
 # этого времени задача, задуманная как постоянно работающая служба, была бы
 # молча убита планировщиком без единой ошибки в самом lanclipd. Zero снимает
-# лимит. RestartCount/RestartInterval — на случай, если процесс всё же упадёт,
-# планировщик поднимет его заново сам, а не оставит соседа видеть мёртвого
-# агента до следующего входа в систему.
+# лимит — это подтверждено проверкой (см. отчёт задачи) и обязательно.
+#
+# RestartCount/RestartInterval — задуманы как страховка на случай падения
+# процесса: если сработают, планировщик поднимет его заново сам, не дожидаясь
+# следующего входа в систему. Оставляю настройку (вреда от неё нет), но
+# честно: живой проверкой на этой машине автоподъём подтвердить НЕ удалось —
+# ни принудительное завершение lanclipd.exe, ни изолированный тестовый Task
+# с чистым "exit 1" не привели к повторному запуску за несколько минут при
+# сконфигурированном RestartInterval в 1 минуту (подробности и дословный
+# вывод — в отчёте задачи 25). Это не обязательное свойство для задачи —
+# обязателен автозапуск при входе в систему, который подтверждён отдельно
+# (Get-ScheduledTask + Start-ScheduledTask). Если это когда-нибудь всплывёт
+# как реальная проблема (агент упал и не поднялся сам), разбираться заново
+# отсюда — этот комментарий и есть та зацепка.
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
     -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
@@ -275,8 +310,14 @@ if (-not $processAlive) {
 
 # Локальная проверка /health — не подтверждает доступность с Mac (это
 # отдельная проверка с той машины, см. отчёт задачи), но подтверждает, что
-# HTTP-сервер реально слушает порт и отвечает валидным JSON.
+# HTTP-сервер реально слушает порт и отвечает валидным JSON. Задача Running и
+# процесс жив — сигналы мягкие (процесс мог подняться и тут же зависнуть на
+# биндинге сокета); сервер, который слушает порт, но не отвечает — самый
+# вероятный настоящий отказ (конфликт порта, кривой конфиг), поэтому эта
+# проверка гейтится так же жёстко, как предыдущие две, а не только
+# предупреждением.
 $healthOk = $false
+$healthDetail = "конфиг не удалось прочитать или в нём нет токена"
 try {
     $configText = [IO.File]::ReadAllText($ConfigFile)
     if ($configText -match '"token"\s*:\s*"([0-9a-f]+)"') {
@@ -284,16 +325,17 @@ try {
         $response = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" `
             -Headers @{ "X-Clip-Token" = $localToken } -UseBasicParsing -TimeoutSec 5
         $healthOk = ($response.StatusCode -eq 200)
+        $healthDetail = "статус ответа: $($response.StatusCode)"
     }
 } catch {
-    $healthOk = $false
+    $healthDetail = "исключение: $($_.Exception.Message)"
 }
 
-if ($healthOk) {
-    Write-Host "    /health локально отвечает 200"
-} else {
-    Write-Warning "Локальный /health не ответил 200 — процесс жив, но стоит разобраться перед тем, как считать установку полностью успешной."
+if (-not $healthOk) {
+    Write-Error "Локальный /health не ответил 200 ($healthDetail) — задача Running и процесс жив, но сервер не обслуживает запросы. Установка не завершена."
+    exit 1
 }
+Write-Host "    /health локально отвечает 200"
 
 Write-Host ""
 Write-Host "Готово. lanclipd поставлен в $BinDest, задача '$TaskName' зарегистрирована и запущена (state=Running)."
