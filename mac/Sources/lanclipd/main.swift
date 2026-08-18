@@ -136,11 +136,21 @@ func runStatus(configURL: URL) {
 
     print("Порт: \(config.port)")
 
+    // Мелкая находка финального ревью: `status` был единственным путём отказа в
+    // проекте, выходящим с кодом 0, когда буфер не прочитался, — раньше ошибка
+    // только печаталась, а функция молча возвращалась. "Сосед не найден" ниже
+    // осознанно НЕ считается отказом самой команды `status` (это нормальное,
+    // информационное состояние — сосед может быть просто выключен), а вот
+    // неспособность прочитать СОБСТВЕННЫЙ буфер — настоящий сбой, о котором
+    // скрипт-обёртка (или человек) должен узнать по коду выхода, а не только
+    // разбирая текст вывода.
+    var bufferReadFailed = false
     do {
         let snapshot = try snapshots.current()
         print("Буфер: kind=\(snapshot.manifest.kind.rawValue), seq=\(snapshot.manifest.seq)")
     } catch {
         print("Буфер: не удалось прочитать (\(describe(error)))")
+        bufferReadFailed = true
     }
 
     let resolver = PeerResolver(config: config, prober: NwHttpClient())
@@ -148,6 +158,10 @@ func runStatus(configURL: URL) {
         print("Сосед: \(peer)")
     } else {
         print(peerNotFoundMessage(resolver))
+    }
+
+    if bufferReadFailed {
+        exit(1)
     }
 }
 
